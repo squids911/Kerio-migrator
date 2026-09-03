@@ -1,0 +1,22 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller/build output
+build/
+dist/
+*.spec
+
+# Runtime data and credentials
+settings.ini
+logs/
+*.log
+
+# Local/editor files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+uploads/
+imap_migrator_pre_wizard.py
