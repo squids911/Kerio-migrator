@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 
-VERSION = "v1.1.45"
+VERSION = "v1.1.46"
 CONFIG_FILE = "settings.ini"
 
 # IMAP servers can return large lines when a mailbox has many flags or folders.
