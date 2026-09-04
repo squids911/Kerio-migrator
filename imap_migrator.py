@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 
-VERSION = "v1.1.46"
+VERSION = "v1.1.47"
 CONFIG_FILE = "settings.ini"
 
 # IMAP servers can return large lines when a mailbox has many flags or folders.
@@ -110,6 +110,61 @@ def format_exception(error):
     if isinstance(error, urllib.error.URLError):
         return f"сетевой сбой: {error.reason}"
     return str(error)
+
+
+IMAP_MONTHS = (
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+IMAP_INTERNALDATE_RE = re.compile(
+    r"^\s*(\d{1,2})-([A-Za-z]{3})-(\d{4})\s+"
+    r"(\d{1,2}):(\d{2}):(\d{2})\s+([+-])(\d{2})(\d{2})\s*$"
+)
+
+
+def normalize_imap_internal_date(value):
+    """Return a strict RFC 3501 INTERNALDATE or ``None``.
+
+    Some source servers return a value that looks like INTERNALDATE but is
+    rejected by Kerio's APPEND parser.  Normalize only the standard English
+    month/date form and omit the optional date when the source value is not
+    valid; APPEND then lets the destination assign its current internal date
+    instead of rejecting the whole message.
+    """
+    raw_value = str(value or "").strip().strip('"')
+    match = IMAP_INTERNALDATE_RE.fullmatch(raw_value)
+    if not match:
+        return None
+
+    day, month_name, year, hour, minute, second, sign, offset_hour, offset_minute = match.groups()
+    month_name = month_name.title()
+    if month_name not in IMAP_MONTHS:
+        return None
+
+    try:
+        day = int(day)
+        month = IMAP_MONTHS.index(month_name) + 1
+        year = int(year)
+        hour = int(hour)
+        minute = int(minute)
+        second = int(second)
+        offset_hour = int(offset_hour)
+        offset_minute = int(offset_minute)
+        # Validate the calendar/time fields without relying on the process
+        # locale (which can make strptime produce non-English month names).
+        datetime(year, month, day, hour, minute, second)
+    except (TypeError, ValueError):
+        return None
+
+    if offset_hour > 23 or offset_minute > 59:
+        return None
+
+    return (
+        f'"{day:02d}-{month_name}-{year:04d} '
+        f"{hour:02d}:{minute:02d}:{second:02d} "
+        f"{sign}{offset_hour:02d}{offset_minute:02d}"
+        '"'
+    )
 
 
 def encode_imap_folder_name(utf8_str):
@@ -3147,6 +3202,8 @@ class ImapMigratorApp:
 
                     success_count = 0
                     skipped_duplicates = 0
+                    use_kerio_internal_date = True
+                    date_fallback_logged = False
 
                     for number in ids:
                         if self.stop_requested:
@@ -3228,13 +3285,47 @@ class ImapMigratorApp:
                                     success_appended = True
                                     break
 
-                                imap_date_arg = f'"{internal_date}"' if internal_date else None
+                                imap_date_arg = (
+                                    normalize_imap_internal_date(internal_date)
+                                    if use_kerio_internal_date
+                                    else None
+                                )
                                 valid_flags = [flag for flag in source_flags if flag.startswith("\\") or flag.startswith("$")]
                                 flags_arg = f"({' '.join(valid_flags)})" if valid_flags else None
                                 # The same payload is sent to Kerio. The
                                 # limiter is shared by all worker threads.
                                 self.rate_limiter.throttle(len(raw_message))
-                                destination_connection.append(kerio_encoded, flags_arg, imap_date_arg, raw_message)
+                                try:
+                                    destination_connection.append(
+                                        kerio_encoded,
+                                        flags_arg,
+                                        imap_date_arg,
+                                        raw_message,
+                                    )
+                                except Exception as append_error:
+                                    # Kerio versions in the field can reject a
+                                    # valid RFC 3501 INTERNALDATE with
+                                    # "Malformed date parameter". The date is
+                                    # optional in APPEND, so retry this message
+                                    # without it instead of losing the message.
+                                    error_text = str(append_error).lower()
+                                    if imap_date_arg and "malformed date parameter" in error_text:
+                                        use_kerio_internal_date = False
+                                        if not date_fallback_logged:
+                                            self.log(
+                                                "   [ПРЕДУПРЕЖДЕНИЕ] Kerio отклонил INTERNALDATE "
+                                                "в APPEND; повторяем такие сообщения без даты.",
+                                                log_file_path,
+                                            )
+                                            date_fallback_logged = True
+                                        destination_connection.append(
+                                            kerio_encoded,
+                                            flags_arg,
+                                            None,
+                                            raw_message,
+                                        )
+                                    else:
+                                        raise
 
                                 if message_id_value:
                                     existing_messages.add(message_id_value)
