@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 
-VERSION = "v1.1.48"
+VERSION = "v1.1.49"
 CONFIG_FILE = "settings.ini"
 
 # IMAP servers can return large lines when a mailbox has many flags or folders.
@@ -165,6 +165,12 @@ def normalize_imap_internal_date(value):
         f"{sign}{offset_hour:02d}{offset_minute:02d}"
         '"'
     )
+
+
+def quote_imap_mailbox(encoded_name):
+    """Quote an IMAP mailbox argument, escaping RFC 3501 string characters."""
+    encoded_name = str(encoded_name or "")
+    return '"' + encoded_name.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def encode_imap_folder_name(utf8_str):
@@ -3177,6 +3183,7 @@ class ImapMigratorApp:
                                 pass
 
                     kerio_encoded = encode_imap_folder_name(kerio_folder_name)
+                    kerio_append_mailbox = quote_imap_mailbox(kerio_encoded)
                     # A set is substantially smaller than {message_id: True}
                     # for large mailboxes. Header FETCH is batched in bounded
                     # chunks to avoid one network round trip per destination
@@ -3301,7 +3308,7 @@ class ImapMigratorApp:
                                 self.rate_limiter.throttle(len(raw_message))
                                 try:
                                     destination_connection.append(
-                                        kerio_encoded,
+                                        kerio_append_mailbox,
                                         flags_arg,
                                         imap_date_arg,
                                         raw_message,
@@ -3328,7 +3335,7 @@ class ImapMigratorApp:
                                             )
                                             date_fallback_logged = True
                                         destination_connection.append(
-                                            kerio_encoded,
+                                            kerio_append_mailbox,
                                             None,
                                             None,
                                             raw_message,
