@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 
-VERSION = "v1.1.47"
+VERSION = "v1.1.48"
 CONFIG_FILE = "settings.ini"
 
 # IMAP servers can return large lines when a mailbox has many flags or folders.
@@ -3202,7 +3202,7 @@ class ImapMigratorApp:
 
                     success_count = 0
                     skipped_duplicates = 0
-                    use_kerio_internal_date = True
+                    use_kerio_append_metadata = True
                     date_fallback_logged = False
 
                     for number in ids:
@@ -3285,13 +3285,17 @@ class ImapMigratorApp:
                                     success_appended = True
                                     break
 
-                                imap_date_arg = (
-                                    normalize_imap_internal_date(internal_date)
-                                    if use_kerio_internal_date
-                                    else None
-                                )
-                                valid_flags = [flag for flag in source_flags if flag.startswith("\\") or flag.startswith("$")]
-                                flags_arg = f"({' '.join(valid_flags)})" if valid_flags else None
+                                if use_kerio_append_metadata:
+                                    imap_date_arg = normalize_imap_internal_date(internal_date)
+                                    valid_flags = [
+                                        flag
+                                        for flag in source_flags
+                                        if flag.startswith("\\") or flag.startswith("$")
+                                    ]
+                                    flags_arg = f"({' '.join(valid_flags)})" if valid_flags else None
+                                else:
+                                    imap_date_arg = None
+                                    flags_arg = None
                                 # The same payload is sent to Kerio. The
                                 # limiter is shared by all worker threads.
                                 self.rate_limiter.throttle(len(raw_message))
@@ -3309,18 +3313,23 @@ class ImapMigratorApp:
                                     # optional in APPEND, so retry this message
                                     # without it instead of losing the message.
                                     error_text = str(append_error).lower()
-                                    if imap_date_arg and "malformed date parameter" in error_text:
-                                        use_kerio_internal_date = False
+                                    if "malformed date parameter" in error_text:
+                                        # Kerio can report this for either the
+                                        # INTERNALDATE or a non-standard source
+                                        # flag. Retry without both optional
+                                        # APPEND metadata fields.
+                                        use_kerio_append_metadata = False
                                         if not date_fallback_logged:
                                             self.log(
-                                                "   [ПРЕДУПРЕЖДЕНИЕ] Kerio отклонил INTERNALDATE "
-                                                "в APPEND; повторяем такие сообщения без даты.",
+                                                "   [ПРЕДУПРЕЖДЕНИЕ] Kerio отклонил "
+                                                "метаданные APPEND; повторяем письма "
+                                                "без даты и флагов.",
                                                 log_file_path,
                                             )
                                             date_fallback_logged = True
                                         destination_connection.append(
                                             kerio_encoded,
-                                            flags_arg,
+                                            None,
                                             None,
                                             raw_message,
                                         )
