@@ -9,6 +9,7 @@ import queue
 import re
 import ssl
 import socket
+import sys
 import threading
 import time
 import tkinter as tk
@@ -19,8 +20,9 @@ from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 
-VERSION = "v1.1.49"
+VERSION = "v1.1.50"
 CONFIG_FILE = "settings.ini"
+MIGRATION_CHECKPOINT_FILE = "migration_checkpoint.json"
 
 # IMAP servers can return large lines when a mailbox has many flags or folders.
 imaplib._MAXLINE = 10000000
@@ -489,8 +491,13 @@ class ImapMigratorApp:
         self.account_checkboxes = {}  # email -> (BooleanVar, password)
         self.csv_accounts_data = []
         self.account_full_names = {}  # email -> full name from CSV
+        self.secret_values = set()
         self.runtime_settings = {}
         self.rate_limiter = NetworkRateLimiter(None)
+        self.checkpoint_lock = threading.Lock()
+        self.checkpoint_state = None
+        self.resume_enabled = False
+        self.checkpoint_dirty_count = 0
 
         # Wizard state and the cache populated on the summary step.
         self.current_step = -1
@@ -783,6 +790,15 @@ class ImapMigratorApp:
             width=18,
         )
         self.wizard_next_btn.pack(side=tk.RIGHT, padx=(5, 10), pady=7)
+        self.global_stop_btn = self._button(
+            footer,
+            "■  Остановить",
+            self.stop_current_operation,
+            kind="danger",
+            width=17,
+        )
+        self.global_stop_btn.pack(side=tk.RIGHT, padx=(5, 0), pady=7)
+        self.global_stop_btn.config(state=tk.DISABLED)
         self.footer_status = tk.Label(
             footer,
             text="Шаг 1: серверы",
@@ -1317,18 +1333,40 @@ class ImapMigratorApp:
         self.log_area.mark_set(tk.INSERT, "1.0")
         self.log_area.see(tk.INSERT)
 
+    def _remember_secret(self, value):
+        value = str(value or "")
+        if value:
+            if not hasattr(self, "secret_values"):
+                self.secret_values = set()
+            self.secret_values.add(value)
+
+    def _redact_log_text(self, value):
+        text = str(value)
+        # Replace longer values first so a short secret cannot partially expose
+        # a longer one. The set is process-local and is never serialized.
+        for secret in sorted(getattr(self, "secret_values", set()), key=len, reverse=True):
+            if len(secret) >= 2:
+                text = text.replace(secret, "[СКРЫТО]")
+        return text
+
     def log(self, message, log_file_path=None):
-        """Queue a log line and flush a batch to Tk at most 20 times/sec."""
+        """Queue a timestamped, password-free log line."""
+        timestamp = datetime.now().strftime("[%Y.%m.%d %H:%M:%S]")
+        text = self._redact_log_text(message)
+        timestamped_message = "\n".join(
+            f"{timestamp} {line}" if line.strip() else line
+            for line in text.splitlines()
+        )
         if log_file_path:
             try:
                 with self.log_lock:
                     with open(log_file_path, "a", encoding="utf-8") as log_file:
-                        log_file.write(message + "\n")
+                        log_file.write(timestamped_message + "\n")
             except Exception:
                 pass
 
         try:
-            self.log_queue.put_nowait(message)
+            self.log_queue.put_nowait(timestamped_message)
         except queue.Full:
             # Keep the newest diagnostics if a server starts producing errors
             # faster than Tk can display them.
@@ -1337,7 +1375,7 @@ class ImapMigratorApp:
             except queue.Empty:
                 pass
             try:
-                self.log_queue.put_nowait(message)
+                self.log_queue.put_nowait(timestamped_message)
             except queue.Full:
                 pass
 
@@ -1423,6 +1461,7 @@ class ImapMigratorApp:
             pass
 
     def _capture_settings(self):
+        self._remember_secret(self.adm_pass.get())
         return {
             "src_host": self.src_host.get().strip(),
             "src_port": self.src_port.get().strip(),
@@ -1554,6 +1593,7 @@ class ImapMigratorApp:
                         continue
                     email_user = row[0].strip()
                     password = row[1].strip()
+                    self._remember_secret(password)
                     full_name = row[2].strip() if len(row) >= 3 else ""
                     key = email_user.lower()
                     if email_user and password and key not in seen:
@@ -1615,13 +1655,50 @@ class ImapMigratorApp:
         if self.account_checkboxes:
             for email_user, (variable, password) in self.account_checkboxes.items():
                 if variable.get():
+                    self._remember_secret(password)
                     accounts.append((email_user, password))
         else:
             email_user = self.src_user.get().strip()
             password = self.src_pass.get()
             if email_user and password:
+                self._remember_secret(password)
                 accounts.append((email_user, password))
         return accounts
+
+    def _operation_is_active(self):
+        return bool(
+            self.server_test_running
+            or self.test_running
+            or self.analysis_running
+            or self.timer_running
+        )
+
+    def _update_global_stop_button(self):
+        if not hasattr(self, "global_stop_btn"):
+            return
+        state = tk.NORMAL if self._operation_is_active() else tk.DISABLED
+
+        def update():
+            try:
+                self.global_stop_btn.config(state=state)
+            except tk.TclError:
+                pass
+
+        try:
+            self.root.after(0, update)
+        except (AttributeError, tk.TclError):
+            update()
+
+    def stop_current_operation(self):
+        """Stop whichever long-running operation is active on the current step."""
+        if self.timer_running:
+            self.stop_migration()
+        elif self.analysis_running:
+            self.stop_analysis()
+        elif self.test_running:
+            self.stop_connection_test()
+        elif self.server_test_running:
+            self.stop_server_availability_test()
 
     def _show_step(self, index):
         if index < 0 or index >= len(self.step_frames):
@@ -1676,6 +1753,7 @@ class ImapMigratorApp:
                 self.wizard_next_btn.config(text="Новая миграция", state=tk.NORMAL)
             else:
                 self.wizard_next_btn.config(text="Выполняется...", state=tk.DISABLED)
+        self._update_global_stop_button()
 
     def _valid_server_fields(self):
         checks = (
@@ -1814,6 +1892,7 @@ class ImapMigratorApp:
         self.runtime_settings = settings
         self.server_test_stop_event.clear()
         self.server_test_running = True
+        self._update_global_stop_button()
         self.server_test_results = {"source": None, "destination": None}
         self.server_test_start_btn.config(state=tk.DISABLED)
         self.server_test_stop_btn.config(state=tk.NORMAL)
@@ -1881,6 +1960,7 @@ class ImapMigratorApp:
 
             stopped = stopped or self.server_test_stop_event.is_set()
             self.server_test_running = False
+            self._update_global_stop_button()
 
             def finish():
                 try:
@@ -1908,6 +1988,20 @@ class ImapMigratorApp:
         self.server_test_stop_btn.config(state=tk.DISABLED)
         self.set_status("ОСТАНОВКА ПРОВЕРКИ", COLORS["red"])
 
+    def stop_analysis(self):
+        if not self.analysis_running:
+            return
+        self.analysis_stop_event.set()
+        self.set_status("ОСТАНОВКА АНАЛИЗА...", COLORS["red"])
+        self.log("\n[ВНИМАНИЕ] Запрос на остановку предварительного анализа...")
+        with self.connection_lock:
+            connections = list(self.active_connections)
+        for connection in connections:
+            try:
+                connection.logout()
+            except Exception:
+                pass
+
     def _analyze_account_for_summary(self, email_user, password):
         source_connection = None
         message_count = 0
@@ -1917,6 +2011,8 @@ class ImapMigratorApp:
             folder_names = list_imap_folders(source_connection)
 
             for folder_name in folder_names:
+                if self.analysis_stop_event.is_set():
+                    return message_count, source_size_mb, "Остановлено"
                 result, _, _selected_name = self._select_imap_folder(source_connection, folder_name)
                 if result == "OK":
                     search_type, search_data = source_connection.search(None, "ALL")
@@ -1949,6 +2045,7 @@ class ImapMigratorApp:
         self.runtime_settings = self._capture_settings()
         signature = self._make_analysis_signature(accounts, self.runtime_settings)
         self.analysis_running = True
+        self._update_global_stop_button()
         self.analysis_stop_event.clear()
         self.analysis_cache = {}
         self.analysis_cache_signature = signature
@@ -1971,6 +2068,8 @@ class ImapMigratorApp:
                     break
                 try:
                     messages, volume, destination_status = self._analyze_account_for_summary(email_user, password)
+                    if self.analysis_stop_event.is_set():
+                        break
                     self.analysis_cache[email_user] = {
                         "messages": messages,
                         "source_size_mb": volume,
@@ -1988,7 +2087,13 @@ class ImapMigratorApp:
                     )
                 except Exception as error:
                     self.analysis_cache[email_user] = {"messages": 0, "source_size_mb": 0.0, "ok": False}
-                    values = (email_user, "—", "—", self.runtime_settings.get("dst_host", ""), f"Ошибка: {error}")
+                    values = (
+                        email_user,
+                        "—",
+                        "—",
+                        self.runtime_settings.get("dst_host", ""),
+                        f"Ошибка: {self._redact_log_text(error)}",
+                    )
 
                 try:
                     self.root.after(
@@ -2003,6 +2108,7 @@ class ImapMigratorApp:
 
             cancelled = self.analysis_stop_event.is_set()
             self.analysis_running = False
+            self._update_global_stop_button()
             self.use_analysis_cache = not cancelled
 
             def finish():
@@ -2053,6 +2159,7 @@ class ImapMigratorApp:
 
         self.test_stop_event.clear()
         self.test_running = True
+        self._update_global_stop_button()
         self.test_start_btn.config(state=tk.DISABLED)
         self.test_stop_btn.config(state=tk.NORMAL)
         self.start_btn.config(state=tk.DISABLED)
@@ -2166,6 +2273,7 @@ class ImapMigratorApp:
             finally:
                 self.test_running = False
                 self.test_stop_event.clear()
+                self._update_global_stop_button()
                 status_text = "ОСТАНОВЛЕНО" if stopped else ("ОШИБКА" if unexpected_error else "ГОТОВ К ЗАПУСКУ")
                 status_color = COLORS["red"] if stopped or unexpected_error else COLORS["dark_3"]
                 self.set_status(status_text, status_color)
@@ -2186,7 +2294,10 @@ class ImapMigratorApp:
                         if not self.timer_running:
                             self.start_btn.config(state=tk.NORMAL)
                         if unexpected_error:
-                            messagebox.showerror("Ошибка тестирования", str(unexpected_error))
+                            messagebox.showerror(
+                                "Ошибка тестирования",
+                                self._redact_log_text(unexpected_error),
+                            )
                         elif stopped:
                             messagebox.showinfo("Тестирование остановлено", "Проверка была остановлена.")
                         else:
@@ -2221,6 +2332,246 @@ class ImapMigratorApp:
     # ------------------------------------------------------------------
     # Migration lifecycle and progress UI
     # ------------------------------------------------------------------
+    def _checkpoint_path(self):
+        """Return the checkpoint path next to the script or packaged EXE."""
+        executable_path = sys.executable if getattr(sys, "frozen", False) else __file__
+        return os.path.join(os.path.dirname(os.path.abspath(executable_path)), MIGRATION_CHECKPOINT_FILE)
+
+    def _checkpoint_signature(self, accounts, settings=None):
+        """Build a resume signature without storing passwords or tokens."""
+        settings = settings or self._capture_settings()
+        account_names = sorted({str(email).strip().lower() for email, _password in accounts if str(email).strip()})
+        return {
+            "accounts": account_names,
+            "source": {
+                "host": str(settings.get("src_host", "")).strip().lower(),
+                "port": str(settings.get("src_port", "")).strip(),
+                "ssl": bool(settings.get("src_ssl", True)),
+            },
+            "destination": {
+                "host": str(settings.get("dst_host", "")).strip().lower(),
+                "port": str(settings.get("dst_port", "")).strip(),
+                "ssl": bool(settings.get("dst_ssl", True)),
+            },
+            "auto_create": bool(settings.get("auto_create", True)),
+        }
+
+    def _new_checkpoint(self, accounts, settings=None):
+        account_states = {}
+        for email_user, _password in accounts:
+            account_states[str(email_user).strip()] = {
+                "status": "pending",
+                "current_folder": None,
+                "folders": {},
+            }
+        return {
+            "format": 1,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "version": VERSION,
+            "signature": self._checkpoint_signature(accounts, settings),
+            "accounts": account_states,
+        }
+
+    def _checkpoint_read(self):
+        try:
+            with open(self._checkpoint_path(), "r", encoding="utf-8") as checkpoint_file:
+                state = json.load(checkpoint_file)
+            if not isinstance(state, dict) or state.get("format") != 1:
+                return None
+            if not isinstance(state.get("signature"), dict) or not isinstance(state.get("accounts"), dict):
+                return None
+            return state
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+            return None
+
+    def _checkpoint_write(self, force=False):
+        """Atomically persist progress; the JSON never contains credentials."""
+        with self.checkpoint_lock:
+            if self.checkpoint_state is None:
+                return False
+            self.checkpoint_dirty_count += 1
+            now = time.monotonic()
+            if not force and self.checkpoint_dirty_count < 10 and now - getattr(self, "checkpoint_last_write", 0.0) < 2.0:
+                return True
+            path = self._checkpoint_path()
+            temporary_path = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}"
+            try:
+                with open(temporary_path, "w", encoding="utf-8") as checkpoint_file:
+                    json.dump(self.checkpoint_state, checkpoint_file, ensure_ascii=False, indent=2, sort_keys=True)
+                    checkpoint_file.write("\n")
+                    checkpoint_file.flush()
+                    os.fsync(checkpoint_file.fileno())
+                os.replace(temporary_path, path)
+                self.checkpoint_dirty_count = 0
+                self.checkpoint_last_write = now
+                return True
+            except (OSError, TypeError, ValueError) as error:
+                try:
+                    if os.path.exists(temporary_path):
+                        os.remove(temporary_path)
+                except OSError:
+                    pass
+                if not getattr(self, "checkpoint_write_warning_logged", False):
+                    self.checkpoint_write_warning_logged = True
+                    self.log(f"[ПРЕДУПРЕЖДЕНИЕ] Не удалось сохранить checkpoint: {error}")
+                return False
+
+    def _checkpoint_prepare(self, accounts, settings):
+        """Load a matching checkpoint or start a fresh, secret-free one."""
+        current_signature = self._checkpoint_signature(accounts, settings)
+        existing = self._checkpoint_read()
+        resume = False
+        if existing and existing.get("signature") == current_signature:
+            try:
+                resume = messagebox.askyesno(
+                    "Продолжить миграцию?",
+                    "Найден checkpoint предыдущей миграции для тех же серверов и аккаунтов.\n\n"
+                    "Продолжить с сохраненного места? Уже обработанные письма повторно не добавляются.",
+                )
+            except tk.TclError:
+                resume = True
+        elif existing:
+            self.log("[ИНФО] Найден checkpoint для другой конфигурации; начинаем новую миграцию.")
+
+        self.checkpoint_state = existing if resume else self._new_checkpoint(accounts, settings)
+        self.resume_enabled = resume
+        self.checkpoint_dirty_count = 0
+        self.checkpoint_last_write = 0.0
+        self.checkpoint_write_warning_logged = False
+        self._checkpoint_write(force=True)
+        if resume:
+            self.log("[ВОЗОБНОВЛЕНИЕ] Используется checkpoint; завершенные письма будут пропущены безопасно по Message-ID/сигнатуре.")
+        else:
+            self.log("[CHECKPOINT] Создана контрольная точка миграции без паролей.")
+
+    def _checkpoint_account_state(self, email_user, create=True):
+        if self.checkpoint_state is None:
+            return None
+        accounts = self.checkpoint_state.setdefault("accounts", {})
+        account_name = str(email_user).strip()
+        state = accounts.get(account_name)
+        if state is None:
+            account_key = next(
+                (
+                    key
+                    for key in accounts
+                    if str(key).strip().lower() == account_name.lower()
+                ),
+                None,
+            )
+            if account_key is not None:
+                state = accounts.get(account_key)
+        if state is None and create:
+            state = {"status": "pending", "current_folder": None, "folders": {}}
+            accounts[account_name] = state
+        if state is not None:
+            state.setdefault("folders", {})
+            state.setdefault("status", "pending")
+            state.setdefault("current_folder", None)
+        return state
+
+    def _checkpoint_folder_state(self, email_user, folder_name, create=True):
+        account_state = self._checkpoint_account_state(email_user, create=create)
+        if account_state is None:
+            return None
+        folders = account_state.setdefault("folders", {})
+        folder_state = folders.get(str(folder_name))
+        if folder_state is None and create:
+            folder_state = {
+                "source_count": None,
+                "completed": False,
+                "last_message_key": None,
+                "completed_keys": [],
+            }
+            folders[str(folder_name)] = folder_state
+        if folder_state is not None:
+            folder_state.setdefault("source_count", None)
+            folder_state.setdefault("completed", False)
+            folder_state.setdefault("last_message_key", None)
+            folder_state.setdefault("completed_keys", [])
+        return folder_state
+
+    def _checkpoint_start_account(self, email_user):
+        with self.checkpoint_lock:
+            account_state = self._checkpoint_account_state(email_user)
+            if account_state is not None:
+                account_state["status"] = "active"
+        self._checkpoint_write()
+
+    def _checkpoint_start_folder(self, email_user, folder_name, source_count):
+        with self.checkpoint_lock:
+            account_state = self._checkpoint_account_state(email_user)
+            folder_state = self._checkpoint_folder_state(email_user, folder_name)
+            if account_state is not None:
+                account_state["status"] = "active"
+                account_state["current_folder"] = str(folder_name)
+            if folder_state is not None:
+                folder_state["source_count"] = int(source_count)
+        self._checkpoint_write()
+
+    def _checkpoint_completed_keys(self, email_user, folder_name):
+        with self.checkpoint_lock:
+            folder_state = self._checkpoint_folder_state(email_user, folder_name, create=False)
+            if not folder_state:
+                return set()
+            return {str(key) for key in folder_state.get("completed_keys", []) if key}
+
+    def _checkpoint_record_message(self, email_user, folder_name, message_key):
+        if not message_key:
+            return
+        with self.checkpoint_lock:
+            folder_state = self._checkpoint_folder_state(email_user, folder_name)
+            if folder_state is None:
+                return
+            completed_keys = folder_state.setdefault("completed_keys", [])
+            message_key = str(message_key)
+            if message_key not in completed_keys:
+                completed_keys.append(message_key)
+            folder_state["last_message_key"] = message_key
+        self._checkpoint_write()
+
+    def _checkpoint_finish_folder(self, email_user, folder_name):
+        with self.checkpoint_lock:
+            folder_state = self._checkpoint_folder_state(email_user, folder_name)
+            if folder_state is not None:
+                folder_state["completed"] = True
+            account_state = self._checkpoint_account_state(email_user)
+            if account_state is not None:
+                account_state["current_folder"] = None
+        self._checkpoint_write(force=True)
+
+    def _checkpoint_account_folders_complete(self, email_user):
+        with self.checkpoint_lock:
+            account_state = self._checkpoint_account_state(email_user, create=False)
+            if not account_state:
+                return False
+            folders = account_state.get("folders", {})
+            return bool(folders) and all(
+                isinstance(folder_state, dict) and folder_state.get("completed")
+                for folder_state in folders.values()
+            )
+
+    def _checkpoint_finish_account(self, email_user):
+        with self.checkpoint_lock:
+            account_state = self._checkpoint_account_state(email_user)
+            if account_state is not None:
+                account_state["status"] = "completed"
+                account_state["current_folder"] = None
+        self._checkpoint_write(force=True)
+
+    def _checkpoint_remove(self):
+        with self.checkpoint_lock:
+            path = self._checkpoint_path()
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                self.log(f"[ПРЕДУПРЕЖДЕНИЕ] Не удалось удалить завершенный checkpoint: {error}")
+            self.checkpoint_state = None
+            self.resume_enabled = False
+            self.checkpoint_dirty_count = 0
+
     def start_migration_thread(self):
         self.save_settings()
         self.runtime_settings = self._capture_settings()
@@ -2236,6 +2587,8 @@ class ImapMigratorApp:
         if not accounts:
             messagebox.showerror("Ошибка", "Не выбрано ни одного ящика для миграции.")
             return
+
+        self._checkpoint_prepare(accounts, self.runtime_settings)
 
         try:
             max_threads = max(1, min(10, int(self.threads_spin.get())))
@@ -2264,6 +2617,7 @@ class ImapMigratorApp:
         account_data_for_ui = self._prepare_account_progress(accounts)
         self.migration_start_time = datetime.now()
         self.timer_running = True
+        self._update_global_stop_button()
         with self.stats_lock:
             self.total_msgs_cache = 0
             self.copied_msgs_cache = 0
@@ -2518,6 +2872,8 @@ class ImapMigratorApp:
             return
         self.stop_requested = True
         self.timer_running = False
+        self._checkpoint_write(force=True)
+        self._update_global_stop_button()
         self.set_status("ОСТАНОВКА...", COLORS["red"])
         self.log("\n[ВНИМАНИЕ] Запрос на остановку. Ожидается завершение текущей операции...")
 
@@ -2597,6 +2953,8 @@ class ImapMigratorApp:
         dst_host = str(self._setting("dst_host", self.dst_host, "")).strip()
         admin_user = str(self._setting("adm_user", self.adm_user, "admin")).strip()
         admin_password = self._setting("adm_pass", self.adm_pass, "")
+        self._remember_secret(admin_password)
+        self._remember_secret(password)
 
         if not admin_password:
             self.log("   [ПРОПУСК АВТОСОЗДАНИЯ] Не указан пароль администратора Kerio.")
@@ -2668,6 +3026,7 @@ class ImapMigratorApp:
                 candidate_token = login_result.get("token") if isinstance(login_result, dict) else None
                 if candidate_token:
                     token = candidate_token
+                    self._remember_secret(token)
                     if login_name != admin_user:
                         self.log(f"   [ИНФО API KERIO] Использован логин администратора '{login_name}'.")
                     break
@@ -3072,8 +3431,10 @@ class ImapMigratorApp:
         safe_email = re.sub(r"[^a-zA-Z0-9_.-]", "_", email_user)
         log_file_path = os.path.join(logs_dir, f"log_{safe_email}_{timestamp}.txt")
 
+        self._remember_secret(password)
         self.log("\n========================================", log_file_path)
         self.log(f"Миграция аккаунта ({VERSION}): {email_user}", log_file_path)
+        self._checkpoint_start_account(email_user)
 
         if not self.test_credentials_and_prepare(email_user, password):
             self.log(f"[ПРОПУСК] Аккаунт {email_user} пропущен.", log_file_path)
@@ -3165,6 +3526,11 @@ class ImapMigratorApp:
                     ids = message_numbers[0].split()
                     folder_total = len(ids)
                     total_account_messages += folder_total
+                    self._checkpoint_start_folder(email_user, decoded_folder_name, folder_total)
+                    checkpoint_completed_keys = self._checkpoint_completed_keys(
+                        email_user,
+                        decoded_folder_name,
+                    )
 
                     kerio_folder_name = decoded_folder_name.replace("|", "/")
                     current_path = ""
@@ -3211,6 +3577,7 @@ class ImapMigratorApp:
                     skipped_duplicates = 0
                     use_kerio_append_metadata = True
                     date_fallback_logged = False
+                    folder_had_error = False
 
                     for number in ids:
                         if self.stop_requested:
@@ -3223,6 +3590,7 @@ class ImapMigratorApp:
                                     number, "(RFC822 FLAGS INTERNALDATE)"
                                 )
                                 if fetch_type != "OK":
+                                    folder_had_error = True
                                     break
 
                                 raw_message = None
@@ -3252,6 +3620,7 @@ class ImapMigratorApp:
                                                 )
 
                                 if not raw_message:
+                                    folder_had_error = True
                                     break
 
                                 # Count the source download toward the global
@@ -3277,8 +3646,18 @@ class ImapMigratorApp:
                                     pass
 
                                 fallback_signature = f"{subject_value}|{date_value}|{from_value}|{message_size}"
+                                message_key = (
+                                    f"id:{message_id_value}"
+                                    if message_id_value
+                                    else f"sig:{fallback_signature}"
+                                )
+                                # Sequence numbers are not stable across IMAP
+                                # sessions. A checkpoint is therefore matched
+                                # by the message's stable ID/signature only.
+                                checkpoint_duplicate = message_key in checkpoint_completed_keys
                                 is_duplicate = (
-                                    (message_id_value and message_id_value in existing_messages)
+                                    checkpoint_duplicate
+                                    or (message_id_value and message_id_value in existing_messages)
                                     or fallback_signature in existing_signatures
                                 )
                                 if is_duplicate:
@@ -3289,6 +3668,12 @@ class ImapMigratorApp:
                                         skipped_callback(1)
                                     if account_progress_callback:
                                         account_progress_callback(1)
+                                    self._checkpoint_record_message(
+                                        email_user,
+                                        decoded_folder_name,
+                                        message_key,
+                                    )
+                                    checkpoint_completed_keys.add(message_key)
                                     success_appended = True
                                     break
 
@@ -3346,6 +3731,12 @@ class ImapMigratorApp:
                                 if message_id_value:
                                     existing_messages.add(message_id_value)
                                 existing_signatures.add(fallback_signature)
+                                self._checkpoint_record_message(
+                                    email_user,
+                                    decoded_folder_name,
+                                    message_key,
+                                )
+                                checkpoint_completed_keys.add(message_key)
                                 success_count += 1
                                 migrated_account_messages += 1
                                 if progress_callback:
@@ -3383,6 +3774,7 @@ class ImapMigratorApp:
                                     except Exception:
                                         pass
                                 else:
+                                    folder_had_error = True
                                     number_text = number.decode("ascii", errors="ignore")
                                     self.log(
                                         f"   [ОШИБКА] Сообщение {number_text} в '{decoded_folder_name}': {socket_error}",
@@ -3393,10 +3785,14 @@ class ImapMigratorApp:
                                 break
 
                         if not success_appended and not self.stop_requested:
+                            folder_had_error = True
                             if progress_callback:
                                 progress_callback(1)
                             if error_callback:
                                 error_callback(1)
+
+                    if not self.stop_requested and not folder_had_error:
+                        self._checkpoint_finish_folder(email_user, decoded_folder_name)
 
                     kerio_count = 0
                     try:
@@ -3430,6 +3826,7 @@ class ImapMigratorApp:
             self.log(f"\n[ОШИБКА АККАУНТА]: {error}", log_file_path)
             return total_account_messages, migrated_account_messages, 0.0, 0.0
         finally:
+            self._checkpoint_write(force=True)
             self._close_connection(source_connection)
             self._close_connection(destination_connection)
 
@@ -3580,6 +3977,15 @@ class ImapMigratorApp:
                             account_progress_callback=account_progress_callback,
                         )
                         migrated_total, migrated_count, _source_size, _destination_size = result
+                        folders_complete = self._checkpoint_account_folders_complete(email_user)
+                        account_complete = (
+                            not self.stop_requested
+                            and migrated_total == account_total
+                            and account_copied[0] >= account_total
+                            and (folders_complete or account_total == 0)
+                        )
+                        if account_complete:
+                            self._checkpoint_finish_account(email_user)
 
                         if self.stop_requested:
                             final_text = f"{email_user}  •  остановлен ({account_copied[0]}/{account_total})"
@@ -3611,7 +4017,19 @@ class ImapMigratorApp:
             for thread in threads:
                 thread.join()
 
+            checkpoint_complete = False
+            if not self.stop_requested and self.checkpoint_state is not None:
+                with self.checkpoint_lock:
+                    checkpoint_accounts = self.checkpoint_state.get("accounts", {})
+                    checkpoint_complete = bool(checkpoint_accounts) and all(
+                        isinstance(state, dict) and state.get("status") == "completed"
+                        for state in checkpoint_accounts.values()
+                    )
+                if checkpoint_complete:
+                    self._checkpoint_remove()
+
             self.timer_running = False
+            self._update_global_stop_button()
             self.process_finished = True
             self.migration_outcome = "stopped" if self.stop_requested else "done"
             status_text = "ОСТАНОВЛЕНО" if self.stop_requested else "ЗАВЕРШЕНА"
@@ -3638,11 +4056,18 @@ class ImapMigratorApp:
 
         except Exception as error:
             self.timer_running = False
+            self._update_global_stop_button()
             self.migration_outcome = "error"
             self.set_status("ОШИБКА", COLORS["red"])
             self.log(f"\n[КРИТИЧЕСКАЯ ОШИБКА]: {error}")
             try:
-                self.root.after(0, lambda: messagebox.showerror("Ошибка миграции", str(error)))
+                self.root.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "Ошибка миграции",
+                        self._redact_log_text(error),
+                    ),
+                )
             except tk.TclError:
                 pass
         finally:
@@ -3660,6 +4085,7 @@ class ImapMigratorApp:
                         "error": ("Ошибка", COLORS["red"]),
                     }.get(self.migration_outcome, ("Готово", COLORS["green"]))
                     self.process_status_label.config(text=outcome_text, fg=outcome_color)
+                    self._update_global_stop_button()
                 except tk.TclError:
                     pass
             try:
@@ -3674,6 +4100,7 @@ class ImapMigratorApp:
         if self.timer_running:
             self.stop_requested = True
             self.timer_running = False
+            self._checkpoint_write(force=True)
         with self.connection_lock:
             connections = list(self.active_connections)
         for connection in connections:

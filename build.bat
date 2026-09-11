@@ -5,7 +5,7 @@ cd /d "%~dp0"
 title IMAP Migrator - Build
 set "APP_NAME=IMAP_Migrator"
 set "SCRIPT=imap_migrator.py"
-set "APP_VERSION=v1.1.49"
+set "APP_VERSION=v1.1.50"
 set "PYTHON="
 
 color 0F

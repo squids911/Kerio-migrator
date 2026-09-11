@@ -12,6 +12,8 @@ dist/
 settings.ini
 logs/
 *.log
+migration_checkpoint.json
+migration_checkpoint.json.tmp-*
 
 # Local/editor files
 .vscode/
