@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 
-VERSION = "v1.1.50"
+VERSION = "v1.1.51"
 CONFIG_FILE = "settings.ini"
 MIGRATION_CHECKPOINT_FILE = "migration_checkpoint.json"
 
@@ -50,6 +50,26 @@ COLORS = {
 }
 
 FONT = "Segoe UI"
+USER_STATUS_LABELS = {
+    "checked": "Проверено",
+    "error": "Ошибка",
+    "checking": "Проверяется",
+    "planned": "Запланировано",
+}
+USER_STATUS_COLORS = {
+    "checked": COLORS["green"],
+    "error": COLORS["red"],
+    "checking": COLORS["orange"],
+    "planned": COLORS["blue"],
+}
+STATUS_LEGEND_ORDER = ("checked", "error", "checking", "planned")
+PROCESS_STATUS_LABELS = {
+    "done": USER_STATUS_LABELS["checked"],
+    "error": USER_STATUS_LABELS["error"],
+    "running": USER_STATUS_LABELS["checking"],
+    "pending": USER_STATUS_LABELS["planned"],
+}
+
 SPEED_LIMIT_OPTIONS = [f"{value} Мбит/с" for value in range(10, 101, 10)] + ["1 Гбит/с", "Без ограничений"]
 
 
@@ -489,6 +509,8 @@ class ImapMigratorApp:
         self.log_flush_pending = False
         self.max_visible_log_lines = 20000
         self.account_checkboxes = {}  # email -> (BooleanVar, password)
+        self.account_status_widgets = {}  # email -> status label in step 2
+        self.account_status_values = {}  # email -> checked/error/checking/planned
         self.csv_accounts_data = []
         self.account_full_names = {}  # email -> full name from CSV
         self.secret_values = set()
@@ -645,6 +667,27 @@ class ImapMigratorApp:
         if width:
             options["width"] = width
         return tk.Button(parent, **options)
+
+    def _status_legend(self, parent):
+        legend = tk.Frame(parent, bg=COLORS["panel"])
+        for status_key in STATUS_LEGEND_ORDER:
+            item = tk.Frame(legend, bg=COLORS["panel"])
+            item.pack(side=tk.LEFT, padx=(0, 12))
+            tk.Label(
+                item,
+                text="●",
+                bg=COLORS["panel"],
+                fg=USER_STATUS_COLORS[status_key],
+                font=(FONT, 9, "bold"),
+            ).pack(side=tk.LEFT)
+            tk.Label(
+                item,
+                text=USER_STATUS_LABELS[status_key],
+                bg=COLORS["panel"],
+                fg=COLORS["muted"],
+                font=(FONT, 8),
+            ).pack(side=tk.LEFT, padx=(3, 0))
+        return legend
 
     def _build_ui(self):
         self.main_frame = tk.Frame(self.root, bg=COLORS["background"])
@@ -1001,6 +1044,7 @@ class ImapMigratorApp:
             font=(FONT, 9, "bold"),
             anchor="w",
         ).pack(fill=tk.X, pady=(0, 3))
+        self._status_legend(csv_box).pack(fill=tk.X, pady=(0, 4))
         csv_list = ScrollableFrame(csv_box, height=260, background=COLORS["panel"])
         csv_list.pack(fill=tk.BOTH, expand=True)
         self.csv_scroll = csv_list
@@ -1047,6 +1091,15 @@ class ImapMigratorApp:
             variable=self.auto_create_var,
             style="Card.TCheckbutton",
         ).pack(anchor="w", pady=(4, 0))
+        self.single_account_status_label = tk.Label(
+            credentials_box,
+            text=f"Статус: {USER_STATUS_LABELS['planned']}",
+            bg=COLORS["panel"],
+            fg=USER_STATUS_COLORS["planned"],
+            font=(FONT, 8, "bold"),
+            anchor="w",
+        )
+        self.single_account_status_label.pack(anchor="w", pady=(4, 0))
 
         user_test_box = self._card(right_column, "Тестирование пользователей")
         user_test_box.grid(row=1, column=0, sticky="nsew")
@@ -1240,6 +1293,7 @@ class ImapMigratorApp:
 
         account_box = self._card(frame, "Прогресс по ящикам")
         account_box.pack(fill=tk.X, pady=(0, 6))
+        self._status_legend(account_box).pack(fill=tk.X, pady=(0, 3))
         account_view = ScrollableFrame(account_box, height=112, background=COLORS["panel"])
         account_view.pack(fill=tk.X)
         self.account_progress_scroll = account_view
@@ -1580,6 +1634,13 @@ class ImapMigratorApp:
         for widget in self.accounts_checklist_frame.winfo_children():
             widget.destroy()
         self.account_checkboxes.clear()
+        self.account_status_widgets.clear()
+        self.account_status_values.clear()
+        if hasattr(self, "single_account_status_label"):
+            self.single_account_status_label.config(
+                text=f"Статус: {USER_STATUS_LABELS['planned']}",
+                fg=USER_STATUS_COLORS["planned"],
+            )
 
         try:
             with open(csv_path, mode="r", encoding="utf-8-sig", newline="") as csv_file:
@@ -1620,14 +1681,28 @@ class ImapMigratorApp:
         for email_user, password in self.csv_accounts_data:
             variable = tk.BooleanVar(value=True)
             full_name = self._account_full_name(email_user)
+            account_row = tk.Frame(self.accounts_checklist_frame, bg=COLORS["panel"])
+            account_row.pack(anchor="w", fill=tk.X, pady=1, padx=4)
+            account_row.columnconfigure(0, weight=1)
             checkbox = ttk.Checkbutton(
-                self.accounts_checklist_frame,
+                account_row,
                 text=f"{email_user}  •  {full_name}" if full_name else email_user,
                 variable=variable,
                 style="Card.TCheckbutton",
             )
-            checkbox.pack(anchor="w", fill=tk.X, pady=1, padx=4)
+            checkbox.grid(row=0, column=0, sticky="ew")
+            status_label = tk.Label(
+                account_row,
+                text=USER_STATUS_LABELS["planned"],
+                bg=COLORS["panel"],
+                fg=USER_STATUS_COLORS["planned"],
+                font=(FONT, 8, "bold"),
+                anchor="e",
+            )
+            status_label.grid(row=0, column=1, sticky="e", padx=(8, 0))
             self.account_checkboxes[email_user] = (variable, password)
+            self.account_status_widgets[email_user] = status_label
+            self.account_status_values[email_user] = "planned"
 
         self.csv_scroll.canvas.yview_moveto(0)
         self.log(f"[ИНФО] Из CSV загружено аккаунтов: {len(self.csv_accounts_data)}")
@@ -1664,6 +1739,37 @@ class ImapMigratorApp:
                 self._remember_secret(password)
                 accounts.append((email_user, password))
         return accounts
+
+    def _set_account_status(self, email_user, status):
+        """Update the per-user status label from a worker-safe callback."""
+        status = status if status in USER_STATUS_LABELS else "planned"
+        self.account_status_values[email_user] = status
+        status_text = USER_STATUS_LABELS[status]
+        status_color = USER_STATUS_COLORS[status]
+
+        def update():
+            widget = self.account_status_widgets.get(email_user)
+            if widget is None:
+                email_key = str(email_user).strip().lower()
+                for known_email, candidate in self.account_status_widgets.items():
+                    if str(known_email).strip().lower() == email_key:
+                        widget = candidate
+                        break
+            try:
+                if widget is not None:
+                    widget.config(text=status_text, fg=status_color)
+                if not self.account_checkboxes and hasattr(self, "single_account_status_label"):
+                    self.single_account_status_label.config(
+                        text=f"Статус: {status_text}",
+                        fg=status_color,
+                    )
+            except tk.TclError:
+                pass
+
+        try:
+            self.root.after(0, update)
+        except (AttributeError, tk.TclError):
+            update()
 
     def _operation_is_active(self):
         return bool(
@@ -2166,15 +2272,27 @@ class ImapMigratorApp:
         self.wizard_back_btn.config(state=tk.DISABLED)
         self.wizard_next_btn.config(state=tk.DISABLED)
         self.test_result_label.config(text="Идет проверка выбранных ящиков...", fg=COLORS["orange"])
+        for email_user in self.account_status_widgets:
+            self._set_account_status(email_user, "planned")
+        if not self.account_checkboxes and hasattr(self, "single_account_status_label"):
+            self.single_account_status_label.config(
+                text=f"Статус: {USER_STATUS_LABELS['planned']}",
+                fg=USER_STATUS_COLORS["planned"],
+            )
         self.set_status("ТЕСТИРОВАНИЕ", COLORS["orange"])
 
         def test_worker():
             stopped = False
             unexpected_error = None
+            current_email_user = None
             try:
                 self.log(f"\n=== ЗАПУСК ТЕСТИРОВАНИЯ ({len(accounts)} аккаунтов) ===")
                 for email_user, password in accounts:
+                    current_email_user = email_user
+                    account_failed = False
+                    self._set_account_status(email_user, "checking")
                     if self.test_stop_event.is_set():
+                        self._set_account_status(email_user, "planned")
                         stopped = True
                         break
 
@@ -2185,9 +2303,11 @@ class ImapMigratorApp:
                             self._close_connection(source_conn)
                             self.log("   [OK] ИСТОЧНИК: успешно.")
                         except Exception as error:
+                            account_failed = True
                             self.log(f"   [ОШИБКА] ИСТОЧНИК: {error}")
 
                     if self.test_stop_event.is_set():
+                        self._set_account_status(email_user, "planned")
                         stopped = True
                         break
 
@@ -2213,6 +2333,7 @@ class ImapMigratorApp:
                                 last_destination_error = error
 
                         if stopped:
+                            self._set_account_status(email_user, "planned")
                             break
 
                         if not destination_ok and auto_create:
@@ -2224,10 +2345,12 @@ class ImapMigratorApp:
                                 # Kerio may need a moment to publish a newly
                                 # created mailbox to its IMAP service.
                                 if self.test_stop_event.wait(3.0):
+                                    self._set_account_status(email_user, "planned")
                                     stopped = True
                                     break
                                 for login_value in login_variants:
                                     if self.test_stop_event.is_set():
+                                        self._set_account_status(email_user, "planned")
                                         stopped = True
                                         break
                                     try:
@@ -2254,6 +2377,7 @@ class ImapMigratorApp:
                                 )
 
                         if not destination_ok and not stopped:
+                            account_failed = True
                             if last_destination_error is not None:
                                 self.log(
                                     "   [ОШИБКА] Авторизация на Kerio не прошла. "
@@ -2262,6 +2386,12 @@ class ImapMigratorApp:
                             else:
                                 self.log("   [ОШИБКА] Авторизация на Kerio не прошла.")
 
+                    if not stopped:
+                        self._set_account_status(
+                            email_user,
+                            "error" if account_failed else "checked",
+                        )
+
                 stopped = stopped or self.test_stop_event.is_set()
                 if stopped:
                     self.log("\n=== ТЕСТИРОВАНИЕ ОСТАНОВЛЕНО ===")
@@ -2269,6 +2399,8 @@ class ImapMigratorApp:
                     self.log("\n=== ТЕСТИРОВАНИЕ ЗАВЕРШЕНО ===")
             except Exception as error:
                 unexpected_error = error
+                if current_email_user and not stopped:
+                    self._set_account_status(current_email_user, "error")
                 self.log(f"\n[КРИТИЧЕСКАЯ ОШИБКА ТЕСТИРОВАНИЯ]: {error}")
             finally:
                 self.test_running = False
@@ -2665,6 +2797,15 @@ class ImapMigratorApp:
             )
             progress.grid(row=0, column=1, sticky="ew")
             progress.configure(maximum=1, value=0)
+            status_label = tk.Label(
+                row,
+                text=PROCESS_STATUS_LABELS["pending"],
+                bg=COLORS["panel"],
+                fg=USER_STATUS_COLORS["planned"],
+                font=(FONT, 8, "bold"),
+                anchor="e",
+            )
+            status_label.grid(row=0, column=2, sticky="e", padx=(8, 0))
             account_data[email_user] = (label, progress)
 
             with self.progress_ui_lock:
@@ -2672,6 +2813,7 @@ class ImapMigratorApp:
                     "row": row,
                     "label": label,
                     "progress": progress,
+                    "status_label": status_label,
                     "text": f"{email_user}  •  ожидание",
                     "status": "pending",
                     "order_index": order_index,
@@ -2778,21 +2920,68 @@ class ImapMigratorApp:
                             state["row"],
                             state["label"],
                             state["progress"],
+                            state["status_label"],
                             state["text"],
                             state["status"],
                             status_styles.get(state["status"], status_styles["pending"]),
+                            PROCESS_STATUS_LABELS.get(state["status"], PROCESS_STATUS_LABELS["pending"]),
+                            USER_STATUS_COLORS.get(
+                                {
+                                    "running": "checking",
+                                    "error": "error",
+                                    "pending": "planned",
+                                    "done": "checked",
+                                }.get(state["status"], "planned"),
+                                USER_STATUS_COLORS["planned"],
+                            ),
                             state["maximum"],
                             state["value"],
                         )
                     )
 
             if reorder_rows:
-                for row, _label, _progress, _text, _status, _style, _maximum, _value in snapshots:
+                for (
+                    row,
+                    _label,
+                    _progress,
+                    _status_label,
+                    _text,
+                    _status,
+                    _style,
+                    _status_text,
+                    _status_color,
+                    _maximum,
+                    _value,
+                ) in snapshots:
                     row.pack_forget()
-                for row, _label, _progress, _text, _status, _style, _maximum, _value in snapshots:
+                for (
+                    row,
+                    _label,
+                    _progress,
+                    _status_label,
+                    _text,
+                    _status,
+                    _style,
+                    _status_text,
+                    _status_color,
+                    _maximum,
+                    _value,
+                ) in snapshots:
                     row.pack(fill=tk.X, pady=2, padx=4)
 
-            for row, label, progress, text, status, style_name, maximum, value in snapshots:
+            for (
+                row,
+                label,
+                progress,
+                status_label,
+                text,
+                status,
+                style_name,
+                status_text,
+                status_color,
+                maximum,
+                value,
+            ) in snapshots:
                 if text != self.account_progress_states.get(id(label), {}).get("shown_text"):
                     label.config(text=text)
                     with self.progress_ui_lock:
@@ -2801,6 +2990,7 @@ class ImapMigratorApp:
                             state["shown_text"] = text
                 if status != self.account_progress_states.get(id(label), {}).get("shown_status"):
                     progress.config(style=style_name)
+                    status_label.config(text=status_text, fg=status_color)
                     with self.progress_ui_lock:
                         state = self.account_progress_states.get(id(label))
                         if state is not None:
@@ -3989,7 +4179,7 @@ class ImapMigratorApp:
 
                         if self.stop_requested:
                             final_text = f"{email_user}  •  остановлен ({account_copied[0]}/{account_total})"
-                            final_status = "error"
+                            final_status = "pending"
                         elif account_total and account_copied[0] < account_total:
                             final_text = f"{email_user}  •  частично ({account_copied[0]}/{account_total})"
                             final_status = "error"
