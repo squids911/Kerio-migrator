@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 
-VERSION = "v1.1.51"
+VERSION = "v1.1.52"
 CONFIG_FILE = "settings.ini"
 MIGRATION_CHECKPOINT_FILE = "migration_checkpoint.json"
 
@@ -260,51 +260,94 @@ def decode_imap_folder_name(encoded_str):
         return encoded_str
 
 
-def extract_imap_folder_name(folder_item):
-    """Extract and decode a mailbox name from an IMAP LIST response."""
-    value = folder_item
-    if isinstance(folder_item, (tuple, list)):
-        for candidate in reversed(folder_item):
-            if candidate not in (None, b"", ""):
-                value = candidate
-                break
-    if isinstance(value, bytes):
-        text = value.decode("utf-8", errors="ignore").strip()
-    else:
-        text = str(value or "").strip()
-    if not text:
-        return ""
+def extract_imap_folder_info(folder_item):
+    """Extract a decoded mailbox name and hierarchy delimiter from LIST."""
+    def as_text(value):
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="ignore").strip()
+        return str(value or "").strip()
 
-    # LIST responses normally quote the mailbox name. Taking the last quoted
-    # token preserves names containing spaces and avoids confusing the quoted
-    # hierarchy delimiter with the mailbox itself.
-    quoted_matches = list(re.finditer(r'"([^"]*)"', text))
+    def unescape_quoted(value):
+        return re.sub(r"\\(.)", r"\1", value)
+
+    values = folder_item if isinstance(folder_item, (tuple, list)) else (folder_item,)
+    text_values = [as_text(value) for value in values if value not in (None, b"", "")]
+    if not text_values:
+        return "", ""
+    text = text_values[-1]
+
+    # LIST responses normally quote both the hierarchy delimiter and mailbox
+    # name. Taking the last quoted token preserves mailbox names containing
+    # spaces; the token before it identifies servers using '.' or '\\' instead
+    # of '/'.
+    quoted_matches = list(re.finditer(r'"((?:\\.|[^"\\])*)"', text))
+    delimiter = ""
+    if len(quoted_matches) >= 2:
+        candidate_delimiter = unescape_quoted(quoted_matches[-2].group(1))
+        if len(candidate_delimiter) == 1:
+            delimiter = candidate_delimiter
+    elif len(quoted_matches) == 1 and text[quoted_matches[0].end():].strip():
+        # Some servers leave a simple mailbox name unquoted, e.g.
+        # ``(flags) "." Parent.Child``.
+        candidate_delimiter = unescape_quoted(quoted_matches[0].group(1))
+        if len(candidate_delimiter) == 1:
+            delimiter = candidate_delimiter
+    elif len(text_values) > 1:
+        # A few IMAP wrappers return (metadata, mailbox) as separate tuple
+        # fields. Recover the delimiter from the metadata field as well.
+        for metadata in text_values[:-1]:
+            metadata_matches = list(re.finditer(r'"((?:\\.|[^"\\])*)"', metadata))
+            for match in metadata_matches:
+                candidate_delimiter = unescape_quoted(match.group(1))
+                if len(candidate_delimiter) == 1:
+                    delimiter = candidate_delimiter
+                    break
+            if delimiter:
+                break
     if quoted_matches and not text[quoted_matches[-1].end():].strip():
-        raw_name = quoted_matches[-1].group(1).replace('\\"', '"')
+        raw_name = unescape_quoted(quoted_matches[-1].group(1))
     else:
         match = re.search(r"(\S+)$", text)
         raw_name = match.group(1) if match else text
     if raw_name.upper() == "NIL":
-        return ""
-    return decode_imap_folder_name(raw_name.strip('"')).strip()
+        return "", delimiter
+    return decode_imap_folder_name(raw_name.strip('"')).strip(), delimiter
 
 
-def list_imap_folders(connection):
-    """Return decoded IMAP mailboxes, including servers with partial LIST."""
+def extract_imap_folder_name(folder_item):
+    """Extract and decode only the mailbox name from an IMAP LIST response."""
+    return extract_imap_folder_info(folder_item)[0]
+
+
+def list_imap_folders(connection, diagnostics=None):
+    """Return decoded IMAP mailboxes, including servers with partial LIST.
+
+    ``diagnostics`` is an optional list populated with LIST failures/statuses;
+    callers that need the old simple return value can omit it.
+    """
     folder_names = []
     successful_list = False
+
+    def report(message):
+        if diagnostics is not None:
+            diagnostics.append(str(message))
+
     # Yandex normally answers LIST "" "*". The percent query is a useful
     # fallback for servers that omit some root-level custom mailboxes from *.
     for pattern in ("*", "%"):
         try:
             status, folder_list = connection.list("", pattern)
-        except Exception:
+        except Exception as error:
+            report(f'LIST "" "{pattern}": {error}')
             continue
         if status != "OK":
+            report(f'LIST "" "{pattern}" вернул статус {status}')
             continue
         successful_list = True
         for folder_item in folder_list or []:
-            folder_name = extract_imap_folder_name(folder_item)
+            folder_name, hierarchy_delimiter = extract_imap_folder_info(folder_item)
+            if hierarchy_delimiter and hierarchy_delimiter != "/":
+                folder_name = folder_name.replace(hierarchy_delimiter, "/")
             if folder_name:
                 folder_names.append(folder_name)
 
@@ -312,12 +355,17 @@ def list_imap_folders(connection):
         try:
             status, folder_list = connection.list()
             if status == "OK":
+                successful_list = True
                 for folder_item in folder_list or []:
-                    folder_name = extract_imap_folder_name(folder_item)
+                    folder_name, hierarchy_delimiter = extract_imap_folder_info(folder_item)
+                    if hierarchy_delimiter and hierarchy_delimiter != "/":
+                        folder_name = folder_name.replace(hierarchy_delimiter, "/")
                     if folder_name:
                         folder_names.append(folder_name)
-        except Exception:
-            pass
+            else:
+                report(f"LIST без аргументов вернул статус {status}")
+        except Exception as error:
+            report(f"LIST без аргументов: {error}")
 
     return deduplicate_folders(folder_names)
 
@@ -511,6 +559,12 @@ class ImapMigratorApp:
         self.account_checkboxes = {}  # email -> (BooleanVar, password)
         self.account_status_widgets = {}  # email -> status label in step 2
         self.account_status_values = {}  # email -> checked/error/checking/planned
+        self.account_folder_widgets = {}  # email -> expandable folder controls
+        self.folder_lists = {}  # email -> tuple of decoded source folders
+        self.folder_selections = {}  # email -> selected decoded source folders
+        self.folder_selection_lock = threading.Lock()
+        self.folder_loading_accounts = set()
+        self.saved_folder_selections = {}
         self.csv_accounts_data = []
         self.account_full_names = {}  # email -> full name from CSV
         self.secret_values = set()
@@ -1045,6 +1099,30 @@ class ImapMigratorApp:
             anchor="w",
         ).pack(fill=tk.X, pady=(0, 3))
         self._status_legend(csv_box).pack(fill=tk.X, pady=(0, 4))
+        folder_actions = tk.Frame(csv_box, bg=COLORS["panel"])
+        folder_actions.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(
+            folder_actions,
+            text="Папки загружаются при раскрытии «Папки» у ящика:",
+            bg=COLORS["panel"],
+            fg=COLORS["muted"],
+            font=(FONT, 8),
+            anchor="w",
+        ).pack(side=tk.LEFT)
+        self._button(
+            folder_actions,
+            "Выделить все",
+            self.select_all_loaded_folders,
+            kind="light",
+            width=13,
+        ).pack(side=tk.RIGHT, padx=(4, 0))
+        self._button(
+            folder_actions,
+            "Снять все",
+            self.deselect_all_loaded_folders,
+            kind="light",
+            width=11,
+        ).pack(side=tk.RIGHT)
         csv_list = ScrollableFrame(csv_box, height=260, background=COLORS["panel"])
         csv_list.pack(fill=tk.BOTH, expand=True)
         self.csv_scroll = csv_list
@@ -1545,6 +1623,24 @@ class ImapMigratorApp:
 
     def save_settings(self):
         config = configparser.ConfigParser()
+        with self.folder_selection_lock:
+            persisted_folder_selections = {
+                str(email): set(selection)
+                for email, selection in getattr(self, "saved_folder_selections", {}).items()
+            }
+            persisted_folder_selections.update(
+                {
+                    str(email): set(selection)
+                    for email, selection in self.folder_selections.items()
+                }
+            )
+            folder_selection_json = json.dumps(
+                {
+                    email: sorted(selection, key=str.casefold)
+                    for email, selection in persisted_folder_selections.items()
+                },
+                ensure_ascii=False,
+            )
         config["Settings"] = {
             "src_host": self.src_host.get(),
             "src_port": self.src_port.get(),
@@ -1560,6 +1656,7 @@ class ImapMigratorApp:
             "threads": str(self.threads_spin.get()),
             "test_src": str(self.test_src_var.get()),
             "test_dst": str(self.test_dst_var.get()),
+            "folder_selection": folder_selection_json,
         }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as config_file:
@@ -1578,6 +1675,15 @@ class ImapMigratorApp:
                 return
 
             settings = config["Settings"]
+            try:
+                saved_folder_selections = json.loads(settings.get("folder_selection", "{}"))
+                if isinstance(saved_folder_selections, dict):
+                    self.saved_folder_selections = {
+                        str(email): set(value) if isinstance(value, list) else set()
+                        for email, value in saved_folder_selections.items()
+                    }
+            except (TypeError, ValueError, json.JSONDecodeError):
+                self.saved_folder_selections = {}
             self.src_host.delete(0, tk.END)
             self.src_host.insert(0, settings.get("src_host", "imap.yandex.ru"))
             self.src_port.delete(0, tk.END)
@@ -1624,6 +1730,7 @@ class ImapMigratorApp:
             filetypes=[("CSV файлы", "*.csv"), ("Все файлы", "*.*")],
         )
         if filename:
+            self.saved_folder_selections = {}
             self.csv_path_entry.delete(0, tk.END)
             self.csv_path_entry.insert(0, filename)
             self.load_csv_accounts(filename)
@@ -1636,6 +1743,11 @@ class ImapMigratorApp:
         self.account_checkboxes.clear()
         self.account_status_widgets.clear()
         self.account_status_values.clear()
+        self.account_folder_widgets.clear()
+        with self.folder_selection_lock:
+            self.folder_lists.clear()
+            self.folder_selections.clear()
+        self.folder_loading_accounts.clear()
         if hasattr(self, "single_account_status_label"):
             self.single_account_status_label.config(
                 text=f"Статус: {USER_STATUS_LABELS['planned']}",
@@ -1681,16 +1793,36 @@ class ImapMigratorApp:
         for email_user, password in self.csv_accounts_data:
             variable = tk.BooleanVar(value=True)
             full_name = self._account_full_name(email_user)
-            account_row = tk.Frame(self.accounts_checklist_frame, bg=COLORS["panel"])
-            account_row.pack(anchor="w", fill=tk.X, pady=1, padx=4)
-            account_row.columnconfigure(0, weight=1)
+            account_section = tk.Frame(self.accounts_checklist_frame, bg=COLORS["panel"])
+            account_section.pack(anchor="w", fill=tk.X, pady=1, padx=4)
+            account_row = tk.Frame(account_section, bg=COLORS["panel"])
+            account_row.pack(fill=tk.X)
+            account_row.columnconfigure(1, weight=1)
+
+            folder_toggle = tk.Button(
+                account_row,
+                text="▸ Папки",
+                command=lambda email=email_user: self.toggle_account_folders(email),
+                bg=COLORS["panel"],
+                activebackground=COLORS["panel_alt"],
+                fg=COLORS["blue"],
+                activeforeground=COLORS["blue"],
+                relief="flat",
+                bd=0,
+                highlightthickness=0,
+                font=(FONT, 8, "bold"),
+                padx=2,
+                pady=2,
+                cursor="hand2",
+            )
+            folder_toggle.grid(row=0, column=0, sticky="w", padx=(0, 5))
             checkbox = ttk.Checkbutton(
                 account_row,
                 text=f"{email_user}  •  {full_name}" if full_name else email_user,
                 variable=variable,
                 style="Card.TCheckbutton",
             )
-            checkbox.grid(row=0, column=0, sticky="ew")
+            checkbox.grid(row=0, column=1, sticky="ew")
             status_label = tk.Label(
                 account_row,
                 text=USER_STATUS_LABELS["planned"],
@@ -1699,10 +1831,52 @@ class ImapMigratorApp:
                 font=(FONT, 8, "bold"),
                 anchor="e",
             )
-            status_label.grid(row=0, column=1, sticky="e", padx=(8, 0))
+            status_label.grid(row=0, column=2, sticky="e", padx=(8, 0))
+
+            folder_frame = tk.Frame(account_section, bg=COLORS["panel_alt"], bd=1, relief="solid")
+            folder_toolbar = tk.Frame(folder_frame, bg=COLORS["panel_alt"])
+            folder_toolbar.pack(fill=tk.X, padx=5, pady=(4, 2))
+            self._button(
+                folder_toolbar,
+                "Выделить все",
+                lambda email=email_user: self.select_all_account_folders(email),
+                kind="light",
+                width=13,
+            ).pack(side=tk.LEFT)
+            self._button(
+                folder_toolbar,
+                "Снять все",
+                lambda email=email_user: self.deselect_all_account_folders(email),
+                kind="light",
+                width=11,
+            ).pack(side=tk.LEFT, padx=(5, 0))
+            folder_message_label = tk.Label(
+                folder_frame,
+                text="Нажмите «Папки», чтобы загрузить список.",
+                bg=COLORS["panel_alt"],
+                fg=COLORS["muted"],
+                font=(FONT, 8),
+                anchor="w",
+            )
+            folder_message_label.pack(fill=tk.X, padx=5, pady=(0, 3))
+            folder_list_frame = tk.Frame(folder_frame, bg=COLORS["panel_alt"])
+            folder_list_frame.pack(fill=tk.X, padx=5, pady=(0, 4))
+
             self.account_checkboxes[email_user] = (variable, password)
             self.account_status_widgets[email_user] = status_label
             self.account_status_values[email_user] = "planned"
+            self.account_folder_widgets[email_user] = {
+                "section": account_section,
+                "toggle": folder_toggle,
+                "folder_frame": folder_frame,
+                "folder_message": folder_message_label,
+                "folder_list_frame": folder_list_frame,
+                "folder_vars": {},
+                "folders": (),
+                "expanded": False,
+                "loaded": False,
+                "loading": False,
+            }
 
         self.csv_scroll.canvas.yview_moveto(0)
         self.log(f"[ИНФО] Из CSV загружено аккаунтов: {len(self.csv_accounts_data)}")
@@ -1714,6 +1888,281 @@ class ImapMigratorApp:
     def deselect_all_accounts(self):
         for variable, _password in self.account_checkboxes.values():
             variable.set(False)
+
+    def _folder_widget_info(self, email_user):
+        info = self.account_folder_widgets.get(email_user)
+        if info is not None:
+            return info
+        email_key = str(email_user).strip().lower()
+        for known_email, candidate in self.account_folder_widgets.items():
+            if str(known_email).strip().lower() == email_key:
+                return candidate
+        return None
+
+    def toggle_account_folders(self, email_user):
+        info = self._folder_widget_info(email_user)
+        if info is None:
+            return
+        if info["expanded"]:
+            info["folder_frame"].pack_forget()
+            info["expanded"] = False
+            info["toggle"].config(text="▸ Папки")
+            return
+
+        info["folder_frame"].pack(fill=tk.X, padx=(24, 0), pady=(0, 2))
+        info["expanded"] = True
+        info["toggle"].config(text="▾ Папки")
+        if not info["loaded"] and not info["loading"]:
+            self._load_account_folders(email_user)
+
+    def _account_password(self, email_user):
+        account = self.account_checkboxes.get(email_user)
+        if account is not None:
+            return account[1]
+        email_key = str(email_user).strip().lower()
+        for known_email, candidate in self.account_checkboxes.items():
+            if str(known_email).strip().lower() == email_key:
+                return candidate[1]
+        try:
+            if self.src_user.get().strip().lower() == email_key:
+                return self.src_pass.get()
+        except (AttributeError, tk.TclError):
+            pass
+        return ""
+
+    def _load_account_folders(self, email_user):
+        info = self._folder_widget_info(email_user)
+        if info is None or info["loading"]:
+            return
+        password = self._account_password(email_user)
+        if not password:
+            info["folder_message"].config(
+                text="Не указан пароль для загрузки папок.",
+                fg=COLORS["red"],
+            )
+            return
+
+        self._remember_secret(password)
+        info["loading"] = True
+        self.folder_loading_accounts.add(email_user)
+        info["folder_message"].config(
+            text="Загрузка списка папок...",
+            fg=COLORS["orange"],
+        )
+        loading_info = info
+
+        def worker():
+            connection = None
+            folders = []
+            list_diagnostics = []
+            error = None
+            try:
+                connection = self.connect_source(email_user, password)
+                folders = sorted(
+                    set(list_imap_folders(connection, diagnostics=list_diagnostics)),
+                    key=lambda item: (item.count("/"), item.casefold()),
+                )
+                if list_diagnostics and not folders:
+                    raise RuntimeError(
+                        "LIST не вернул папки: " + "; ".join(list_diagnostics)
+                    )
+            except Exception as folder_error:
+                error = folder_error
+            finally:
+                self._close_connection(connection)
+
+            def finish():
+                current_info = self._folder_widget_info(email_user)
+                if current_info is None or current_info is not loading_info:
+                    return
+                self.folder_loading_accounts.discard(email_user)
+                current_info["loading"] = False
+                if error is not None:
+                    current_info["folder_message"].config(
+                        text=f"Ошибка загрузки папок: {self._redact_log_text(error)}",
+                        fg=COLORS["red"],
+                    )
+                    self.log(f"[ОШИБКА ПАПОК {email_user}]: {error}")
+                    return
+                if list_diagnostics:
+                    self.log(
+                        f"[ПРЕДУПРЕЖДЕНИЕ ПАПОК {email_user}]: "
+                        + "; ".join(list_diagnostics)
+                    )
+                self._populate_account_folders(email_user, folders)
+
+            try:
+                self.root.after(0, finish)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _populate_account_folders(self, email_user, folders):
+        info = self._folder_widget_info(email_user)
+        if info is None:
+            return
+        unique_folders = sorted(
+            {str(folder).strip() for folder in folders if str(folder).strip()},
+            key=lambda item: (item.count("/"), item.casefold()),
+        )
+        for widget in info["folder_list_frame"].winfo_children():
+            widget.destroy()
+        info["folder_vars"] = {}
+        info["folders"] = tuple(unique_folders)
+        info["loaded"] = True
+        saved_selection = self._saved_folder_selection_for_account(email_user)
+        selected_folders = (
+            set(unique_folders)
+            if saved_selection is None
+            else set(unique_folders).intersection(saved_selection)
+        )
+        with self.folder_selection_lock:
+            self.folder_lists[email_user] = tuple(unique_folders)
+            self.folder_selections[email_user] = selected_folders
+
+        if not unique_folders:
+            info["folder_message"].config(
+                text="Папки не найдены.",
+                fg=COLORS["red"],
+            )
+            return
+
+        for folder_name in unique_folders:
+            variable = tk.BooleanVar(value=folder_name in selected_folders)
+            depth = folder_name.count("/")
+            display_name = f"{'    ' * depth}{folder_name}"
+            checkbox = ttk.Checkbutton(
+                info["folder_list_frame"],
+                text=display_name,
+                variable=variable,
+                style="Card.TCheckbutton",
+                command=lambda email=email_user, folder=folder_name, var=variable: self._set_folder_selection(
+                    email,
+                    folder,
+                    var.get(),
+                ),
+            )
+            checkbox.pack(anchor="w", fill=tk.X, pady=1)
+            info["folder_vars"][folder_name] = variable
+
+        selection_text = (
+            "выбраны все"
+            if len(selected_folders) == len(unique_folders)
+            else f"выбрано: {len(selected_folders)}"
+        )
+        info["folder_message"].config(
+            text=f"Найдено папок: {len(unique_folders)}; {selection_text}.",
+            fg=COLORS["muted"],
+        )
+
+    def _set_folder_selection(self, email_user, folder_name, selected):
+        with self.folder_selection_lock:
+            selection = self.folder_selections.setdefault(email_user, set())
+            if selected:
+                selection.add(folder_name)
+            else:
+                selection.discard(folder_name)
+            self.saved_folder_selections[email_user] = set(selection)
+            selected_count = len(selection)
+        info = self._folder_widget_info(email_user)
+        if info is not None and info["loaded"]:
+            total_count = len(info["folders"])
+            selection_text = (
+                "выбраны все"
+                if selected_count == total_count
+                else f"выбрано: {selected_count}"
+            )
+            info["folder_message"].config(
+                text=f"Найдено папок: {total_count}; {selection_text}.",
+                fg=COLORS["muted"],
+            )
+
+    def select_all_account_folders(self, email_user):
+        info = self._folder_widget_info(email_user)
+        if info is None or not info["loaded"]:
+            return
+        for variable in info["folder_vars"].values():
+            variable.set(True)
+        with self.folder_selection_lock:
+            self.folder_selections[email_user] = set(info["folders"])
+            self.saved_folder_selections[email_user] = set(info["folders"])
+        info["folder_message"].config(
+            text=f"Выбраны все папки: {len(info['folders'])}.",
+            fg=COLORS["muted"],
+        )
+
+    def deselect_all_account_folders(self, email_user):
+        info = self._folder_widget_info(email_user)
+        if info is None or not info["loaded"]:
+            return
+        for variable in info["folder_vars"].values():
+            variable.set(False)
+        with self.folder_selection_lock:
+            self.folder_selections[email_user] = set()
+            self.saved_folder_selections[email_user] = set()
+        info["folder_message"].config(
+            text="Папки не выбраны.",
+            fg=COLORS["muted"],
+        )
+
+    def select_all_loaded_folders(self):
+        for email_user in tuple(self.account_folder_widgets):
+            self.select_all_account_folders(email_user)
+
+    def deselect_all_loaded_folders(self):
+        for email_user in tuple(self.account_folder_widgets):
+            self.deselect_all_account_folders(email_user)
+
+    def _saved_folder_selection_for_account(self, email_user):
+        email_key = str(email_user).strip().lower()
+        saved = getattr(self, "saved_folder_selections", {})
+        for known_email, selection in saved.items():
+            if str(known_email).strip().lower() == email_key:
+                return set(selection)
+        return None
+
+    def _selected_folders_for_account(self, email_user):
+        email_key = str(email_user).strip().lower()
+        folder_lists = getattr(self, "folder_lists", {})
+        folder_selections = getattr(self, "folder_selections", {})
+
+        def read_selection():
+            known_email = next(
+                (
+                    known
+                    for known in folder_lists
+                    if str(known).strip().lower() == email_key
+                ),
+                None,
+            )
+            if known_email is None:
+                return self._saved_folder_selection_for_account(email_user)
+            return set(folder_selections.get(known_email, folder_lists[known_email]))
+
+        lock = getattr(self, "folder_selection_lock", None)
+        if lock is None:
+            return read_selection()
+        with lock:
+            return read_selection()
+
+    def _filter_selected_folders(self, email_user, folder_names):
+        selected = self._selected_folders_for_account(email_user)
+        if selected is None:
+            return list(folder_names)
+        return [folder for folder in folder_names if folder in selected]
+
+    def _folder_selection_signature(self, accounts):
+        signature = []
+        for email_user, _password in accounts:
+            selected = self._selected_folders_for_account(email_user)
+            signature.append(
+                (
+                    str(email_user).strip().lower(),
+                    None if selected is None else tuple(sorted(selected, key=str.casefold)),
+                )
+            )
+        return tuple(signature)
 
     def _account_full_name(self, email_user):
         """Return the optional display name from the third CSV column."""
@@ -1900,6 +2349,12 @@ class ImapMigratorApp:
             if self.test_running:
                 messagebox.showinfo("Тест выполняется", "Сначала остановите или завершите тестирование пользователей.")
                 return
+            if self.folder_loading_accounts:
+                messagebox.showinfo(
+                    "Папки загружаются",
+                    "Дождитесь завершения загрузки списков папок.",
+                )
+                return
             accounts = self._selected_accounts()
             if not accounts:
                 messagebox.showerror("Ошибка", "Выберите ящики в CSV или заполните одиночный аккаунт.")
@@ -1962,6 +2417,7 @@ class ImapMigratorApp:
             settings.get("dst_port", ""),
             bool(settings.get("dst_ssl", True)),
             bool(settings.get("auto_create", True)),
+            self._folder_selection_signature(accounts),
         )
 
     def _update_route_labels(self, settings=None):
@@ -2114,7 +2570,17 @@ class ImapMigratorApp:
         source_size_mb = 0.0
         try:
             source_connection = self.connect_source(email_user, password)
-            folder_names = list_imap_folders(source_connection)
+            selected_folders = self._selected_folders_for_account(email_user)
+            list_diagnostics = []
+            folder_names = self._filter_selected_folders(
+                email_user,
+                list_imap_folders(source_connection, diagnostics=list_diagnostics),
+            )
+            if list_diagnostics:
+                self.log(
+                    f"[ПРЕДУПРЕЖДЕНИЕ LIST {email_user}]: "
+                    + "; ".join(list_diagnostics)
+                )
 
             for folder_name in folder_names:
                 if self.analysis_stop_event.is_set():
@@ -2125,7 +2591,12 @@ class ImapMigratorApp:
                     if search_type == "OK" and search_data and search_data[0]:
                         message_count += len(search_data[0].split())
 
-            source_size_mb = self.get_mailbox_size_mb(source_connection, email_user, password)
+            source_size_mb = self.get_mailbox_size_mb(
+                source_connection,
+                email_user,
+                password,
+                selected_folders=selected_folders,
+            )
         finally:
             self._close_connection(source_connection)
 
@@ -2486,6 +2957,13 @@ class ImapMigratorApp:
                 "ssl": bool(settings.get("dst_ssl", True)),
             },
             "auto_create": bool(settings.get("auto_create", True)),
+            "folders": [
+                [
+                    email,
+                    None if selected is None else list(selected),
+                ]
+                for email, selected in self._folder_selection_signature(accounts)
+            ],
         }
 
     def _new_checkpoint(self, accounts, settings=None):
@@ -2705,6 +3183,12 @@ class ImapMigratorApp:
             self.checkpoint_dirty_count = 0
 
     def start_migration_thread(self):
+        if self.folder_loading_accounts:
+            messagebox.showinfo(
+                "Папки загружаются",
+                "Дождитесь завершения загрузки списков папок.",
+            )
+            return
         self.save_settings()
         self.runtime_settings = self._capture_settings()
         selected_speed = self.runtime_settings.get("speed_limit", "Без ограничений")
@@ -3451,23 +3935,30 @@ class ImapMigratorApp:
     # ------------------------------------------------------------------
     # Mailbox inspection and migration
     # ------------------------------------------------------------------
-    def get_mailbox_size_mb(self, connection, email_user, password):
+    def get_mailbox_size_mb(self, connection, email_user, password, selected_folders=None):
         total_bytes = 0
-        try:
-            response_type, data = connection.getquotaroot("INBOX")
-            if response_type == "OK" and data:
-                for response in data:
-                    if isinstance(response, bytes):
-                        response_text = response.decode("utf-8", errors="ignore")
-                        match = re.search(r"STORAGE\s+(\d+)\s+(\d+)", response_text, re.IGNORECASE)
-                        if match:
-                            used_kb = int(match.group(1))
-                            return round(used_kb / 1024.0, 2)
-        except Exception:
-            pass
+        # QUOTA STORAGE describes the whole account. It is useful for a full
+        # migration, but would be misleading when the user selected only a
+        # subset of folders.
+        if selected_folders is None:
+            try:
+                response_type, data = connection.getquotaroot("INBOX")
+                if response_type == "OK" and data:
+                    for response in data:
+                        if isinstance(response, bytes):
+                            response_text = response.decode("utf-8", errors="ignore")
+                            match = re.search(r"STORAGE\s+(\d+)\s+(\d+)", response_text, re.IGNORECASE)
+                            if match:
+                                used_kb = int(match.group(1))
+                                return round(used_kb / 1024.0, 2)
+            except Exception:
+                pass
 
         try:
             folder_names = list_imap_folders(connection)
+            if selected_folders is not None:
+                selected_folders = set(selected_folders)
+                folder_names = [folder for folder in folder_names if folder in selected_folders]
             if not folder_names:
                 return 0.0
 
@@ -3584,6 +4075,12 @@ class ImapMigratorApp:
             name_variants.append(folder_name.replace("|", "/"))
         if "/" in folder_name:
             name_variants.append(folder_name.replace("/", "|"))
+            # LIST normalizes the hierarchy delimiter to '/', but SELECT
+            # still needs the delimiter used by the source server. Trying the
+            # common dot and backslash forms keeps normalized nested names
+            # selectable on servers that advertise those delimiters.
+            name_variants.append(folder_name.replace("/", "."))
+            name_variants.append(folder_name.replace("/", "\\"))
 
         select_names = []
         for name in name_variants:
@@ -3649,7 +4146,13 @@ class ImapMigratorApp:
             if destination_connection is None:
                 raise RuntimeError("Не удалось подключиться к Kerio после проверки учетных данных")
 
-            source_size_mb = self.get_mailbox_size_mb(source_connection, email_user, password)
+            selected_folders = self._selected_folders_for_account(email_user)
+            source_size_mb = self.get_mailbox_size_mb(
+                source_connection,
+                email_user,
+                password,
+                selected_folders=selected_folders,
+            )
 
             try:
                 source_connection.noop()
@@ -3657,14 +4160,28 @@ class ImapMigratorApp:
                 self._close_connection(source_connection)
                 source_connection = self.connect_source(email_user, password)
 
-            parsed_folders = sorted(
-                set(list_imap_folders(source_connection)),
+            list_diagnostics = []
+            all_source_folders = sorted(
+                set(list_imap_folders(source_connection, diagnostics=list_diagnostics)),
                 key=lambda item: (item.count("/"), item),
             )
+            if list_diagnostics:
+                self.log(
+                    "[ПРЕДУПРЕЖДЕНИЕ LIST] " + "; ".join(list_diagnostics),
+                    log_file_path,
+                )
+            parsed_folders = self._filter_selected_folders(email_user, all_source_folders)
             self.log(
-                "[ПАПКИ IMAP] Найдены: " + (", ".join(parsed_folders) if parsed_folders else "нет"),
+                "[ПАПКИ IMAP] Найдены: "
+                + (", ".join(all_source_folders) if all_source_folders else "нет"),
                 log_file_path,
             )
+            if selected_folders is not None:
+                self.log(
+                    "[ПАПКИ IMAP] Выбраны для миграции: "
+                    + (", ".join(parsed_folders) if parsed_folders else "нет"),
+                    log_file_path,
+                )
 
             for decoded_folder_name in parsed_folders:
                 if self.stop_requested:
@@ -4026,7 +4543,16 @@ class ImapMigratorApp:
         account_messages = 0
         try:
             temporary_connection = self.connect_source(email_user, password)
-            folder_names = list_imap_folders(temporary_connection)
+            list_diagnostics = []
+            folder_names = self._filter_selected_folders(
+                email_user,
+                list_imap_folders(temporary_connection, diagnostics=list_diagnostics),
+            )
+            if list_diagnostics:
+                self.log(
+                    f"[ПРЕДУПРЕЖДЕНИЕ LIST {email_user}]: "
+                    + "; ".join(list_diagnostics)
+                )
             if not folder_names:
                 return 0
 
@@ -4284,6 +4810,7 @@ class ImapMigratorApp:
                 pass
 
     def on_close(self):
+        self.save_settings()
         self.test_stop_event.set()
         self.server_test_stop_event.set()
         self.analysis_stop_event.set()
