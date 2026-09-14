@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 
-VERSION = "v1.1.53"
+VERSION = "v1.1.55"
 CONFIG_FILE = "settings.ini"
 MIGRATION_CHECKPOINT_FILE = "migration_checkpoint.json"
 
@@ -2161,6 +2161,58 @@ class ImapMigratorApp:
             return list(folder_names)
         return [folder for folder in folder_names if folder in selected]
 
+    def _fallback_folder_names(self, email_user):
+        """Folder names known from the earlier successful analysis (step 2).
+
+        Used when the server can no longer answer LIST at all (e.g. Yandex
+        replies BAD for an account that gained a folder named with quotes it
+        fails to serialize). SELECT-by-name still works in that state.
+        """
+        email_key = str(email_user).strip().lower()
+        sort_key = lambda item: (str(item).count("/"), str(item).casefold())
+        folder_lists = getattr(self, "folder_lists", {})
+        for known_email, folders in folder_lists.items():
+            if str(known_email).strip().lower() == email_key and folders:
+                return sorted(set(folders), key=sort_key)
+        selected = self._selected_folders_for_account(email_user)
+        if selected:
+            return sorted(set(selected), key=sort_key)
+        return []
+
+    def _collect_source_folders(self, connection, email_user, attempts=3, delay_seconds=20):
+        """Return (folder_names, diagnostics) with LIST retry and fallback.
+
+        A failed LIST previously meant "account has no folders", and the
+        account was skipped with 0 transferred messages. Yandex's BAD reply
+        is often transient, so retry briefly; if it persists, fall back to
+        the folder snapshot from the successful analysis.
+        """
+        diagnostics = []
+        folder_names = []
+        attempts = max(1, int(attempts))
+        for attempt in range(1, attempts + 1):
+            folder_names = list_imap_folders(connection, diagnostics=diagnostics)
+            if folder_names or self.stop_requested:
+                break
+            if attempt < attempts:
+                self.log(
+                    f"[ПОВТОР LIST {email_user}] папки не получены "
+                    f"(попытка {attempt}/{attempts}); пауза {delay_seconds} с..."
+                )
+                retry_at = time.monotonic() + max(1, int(delay_seconds))
+                while time.monotonic() < retry_at and not self.stop_requested:
+                    time.sleep(0.5)
+        if not folder_names:
+            fallback = self._fallback_folder_names(email_user)
+            if fallback:
+                self.log(
+                    f"[ВНИМАНИЕ LIST {email_user}] Сервер не вернул список папок; "
+                    f"использую {len(fallback)} папок из анализа."
+                )
+                folder_names = fallback
+        return folder_names, diagnostics
+
+
     def _folder_selection_signature(self, accounts):
         signature = []
         for email_user, _password in accounts:
@@ -2580,11 +2632,10 @@ class ImapMigratorApp:
         try:
             source_connection = self.connect_source(email_user, password)
             selected_folders = self._selected_folders_for_account(email_user)
-            list_diagnostics = []
-            folder_names = self._filter_selected_folders(
-                email_user,
-                list_imap_folders(source_connection, diagnostics=list_diagnostics),
+            collected_folders, list_diagnostics = self._collect_source_folders(
+                source_connection, email_user
             )
+            folder_names = self._filter_selected_folders(email_user, collected_folders)
             if list_diagnostics:
                 self.log(
                     f"[ПРЕДУПРЕЖДЕНИЕ LIST {email_user}]: "
@@ -3969,6 +4020,10 @@ class ImapMigratorApp:
 
         try:
             folder_names = list_imap_folders(connection)
+            if not folder_names and selected_folders is not None:
+                # Source-only fallback: the destination call passes
+                # selected_folders=None and must not see source folder names.
+                folder_names = self._fallback_folder_names(email_user)
             if selected_folders is not None:
                 selected_folders = set(selected_folders)
                 folder_names = [folder for folder in folder_names if folder in selected_folders]
@@ -4139,7 +4194,16 @@ class ImapMigratorApp:
         select_names = []
         for name in name_variants:
             encoded = encode_imap_folder_name(name)
-            for select_name in (encoded, f'"{encoded}"', name, f'"{name}"'):
+            for select_name in (
+                encoded,
+                quote_imap_mailbox(encoded),
+                name,
+                quote_imap_mailbox(name),
+            ):
+                # quote_imap_mailbox escapes inner '"' and '\'. A naive
+                # f'"{name}"' wrapper produces an invalid quoted string for
+                # folders like 'INBOX/Папка "Важное"', so such folders could
+                # never be selected before.
                 if select_name not in select_names:
                     select_names.append(select_name)
 
@@ -4214,9 +4278,11 @@ class ImapMigratorApp:
                 self._close_connection(source_connection)
                 source_connection = self.connect_source(email_user, password)
 
-            list_diagnostics = []
+            collected_folders, list_diagnostics = self._collect_source_folders(
+                source_connection, email_user
+            )
             all_source_folders = sorted(
-                set(list_imap_folders(source_connection, diagnostics=list_diagnostics)),
+                set(collected_folders),
                 key=lambda item: (item.count("/"), item),
             )
             if list_diagnostics:
@@ -4647,11 +4713,10 @@ class ImapMigratorApp:
         account_messages = 0
         try:
             temporary_connection = self.connect_source(email_user, password)
-            list_diagnostics = []
-            folder_names = self._filter_selected_folders(
-                email_user,
-                list_imap_folders(temporary_connection, diagnostics=list_diagnostics),
+            collected_folders, list_diagnostics = self._collect_source_folders(
+                temporary_connection, email_user
             )
+            folder_names = self._filter_selected_folders(email_user, collected_folders)
             if list_diagnostics:
                 self.log(
                     f"[ПРЕДУПРЕЖДЕНИЕ LIST {email_user}]: "
