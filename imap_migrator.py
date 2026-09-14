@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 
-VERSION = "v1.1.56"
+VERSION = "v1.1.57"
 CONFIG_FILE = "settings.ini"
 MIGRATION_CHECKPOINT_FILE = "migration_checkpoint.json"
 
@@ -401,9 +401,14 @@ def list_imap_folders(connection, diagnostics=None):
 
     # Yandex normally answers LIST "" "*". The percent query is a useful
     # fallback for servers that omit some root-level custom mailboxes from *.
+    # IMPORTANT: directory must be the quoted empty string '""'. imaplib
+    # serializes a plain "" to an EMPTY argument, producing "LIST  *" (two
+    # spaces), which strict servers like Yandex reject with
+    # BAD "Command syntax error" — and Yandex counts those BADs toward its
+    # per-session "Too many bad commands" poisoning threshold.
     for pattern in ("*", "%"):
         try:
-            status, folder_list = connection.list("", pattern)
+            status, folder_list = connection.list('""', pattern)
         except Exception as error:
             report(f'LIST "" "{pattern}": {error}')
             continue
