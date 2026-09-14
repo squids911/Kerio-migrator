@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 
-VERSION = "v1.1.55"
+VERSION = "v1.1.56"
 CONFIG_FILE = "settings.ini"
 MIGRATION_CHECKPOINT_FILE = "migration_checkpoint.json"
 
@@ -202,6 +202,64 @@ def quote_imap_mailbox(encoded_name):
     """Quote an IMAP mailbox argument, escaping RFC 3501 string characters."""
     encoded_name = str(encoded_name or "")
     return '"' + encoded_name.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+_IMAP_ATOM_FORBIDDEN = frozenset('(){%*"\\]')
+
+
+def is_imap_atom_safe(value):
+    """True if a mailbox name is a plain RFC 3501 atom (syntax-safe bare)."""
+    if not value:
+        return False
+    for character in str(value):
+        if ord(character) < 0x21 or ord(character) >= 0x7F or character in _IMAP_ATOM_FORBIDDEN:
+            return False
+    return True
+
+
+def build_imap_select_variants(folder_name):
+    """Ordered mailbox SELECT variants, valid syntax first.
+
+    Bare atoms are offered only for atom-safe names. Sending ``SELECT`` with
+    a raw name containing spaces/quotes counts as a BAD command on Yandex,
+    and Yandex poisons the whole session after several BADs with "Too many
+    bad commands from your client", killing every next command. Quoted
+    strings with escaped '"' and '\\' are accepted by any RFC 3501 server,
+    so they always come first.
+    """
+    name_variants = [folder_name]
+    if "|" in folder_name:
+        name_variants.append(folder_name.replace("|", "/"))
+    if "/" in folder_name:
+        name_variants.append(folder_name.replace("/", "|"))
+        # LIST normalizes the hierarchy delimiter to '/', but SELECT still
+        # needs the delimiter used by the source server. Trying the common
+        # dot and backslash forms keeps normalized nested names selectable
+        # on servers that advertise those delimiters.
+        name_variants.append(folder_name.replace("/", "."))
+        name_variants.append(folder_name.replace("/", "\\"))
+
+    select_names = []
+    for name in name_variants:
+        encoded = encode_imap_folder_name(name)
+        for candidate in (
+            quote_imap_mailbox(encoded),
+            encoded,
+            quote_imap_mailbox(name),
+            name,
+        ):
+            if candidate == encoded and not is_imap_atom_safe(encoded):
+                continue
+            if candidate == name and not is_imap_atom_safe(name):
+                continue
+            if candidate not in select_names:
+                select_names.append(candidate)
+    return select_names
+
+
+def is_bad_commands_poison(error_text):
+    """Yandex marker of a session poisoned after too many BAD commands."""
+    return "too many bad commands" in str(error_text or "").lower()
 
 
 def encode_imap_folder_name(utf8_str):
@@ -2179,13 +2237,14 @@ class ImapMigratorApp:
             return sorted(set(selected), key=sort_key)
         return []
 
-    def _collect_source_folders(self, connection, email_user, attempts=3, delay_seconds=20):
-        """Return (folder_names, diagnostics) with LIST retry and fallback.
+    def _collect_source_folders(self, connection, email_user, password, attempts=2, delay_seconds=15):
+        """Return (folder_names, diagnostics, connection) with LIST recovery.
 
-        A failed LIST previously meant "account has no folders", and the
-        account was skipped with 0 transferred messages. Yandex's BAD reply
-        is often transient, so retry briefly; if it persists, fall back to
-        the folder snapshot from the successful analysis.
+        A failed LIST used to mean "account has no folders". Yandex counts
+        BAD commands per session and then poisons it ("Too many bad commands
+        from your client"), so retry LIST on a FRESH session, not the
+        poisoned one. If it still fails, fall back to the folder snapshot
+        from the step-2 analysis.
         """
         diagnostics = []
         folder_names = []
@@ -2197,11 +2256,19 @@ class ImapMigratorApp:
             if attempt < attempts:
                 self.log(
                     f"[ПОВТОР LIST {email_user}] папки не получены "
-                    f"(попытка {attempt}/{attempts}); пауза {delay_seconds} с..."
+                    f"(попытка {attempt}/{attempts}); новая сессия через {delay_seconds} с..."
                 )
                 retry_at = time.monotonic() + max(1, int(delay_seconds))
                 while time.monotonic() < retry_at and not self.stop_requested:
                     time.sleep(0.5)
+                if self.stop_requested:
+                    break
+                self._close_connection(connection)
+                try:
+                    connection = self.connect_source(email_user, password)
+                except Exception as reconnect_error:
+                    diagnostics.append(f"переподключение: {reconnect_error}")
+                    break
         if not folder_names:
             fallback = self._fallback_folder_names(email_user)
             if fallback:
@@ -2210,7 +2277,7 @@ class ImapMigratorApp:
                     f"использую {len(fallback)} папок из анализа."
                 )
                 folder_names = fallback
-        return folder_names, diagnostics
+        return folder_names, diagnostics, connection
 
 
     def _folder_selection_signature(self, accounts):
@@ -2632,8 +2699,8 @@ class ImapMigratorApp:
         try:
             source_connection = self.connect_source(email_user, password)
             selected_folders = self._selected_folders_for_account(email_user)
-            collected_folders, list_diagnostics = self._collect_source_folders(
-                source_connection, email_user
+            collected_folders, list_diagnostics, source_connection = self._collect_source_folders(
+                source_connection, email_user, password
             )
             folder_names = self._filter_selected_folders(email_user, collected_folders)
             if list_diagnostics:
@@ -2645,11 +2712,25 @@ class ImapMigratorApp:
             for folder_name in folder_names:
                 if self.analysis_stop_event.is_set():
                     return message_count, source_size_mb, "Остановлено"
-                result, _, _selected_name = self._select_imap_folder(source_connection, folder_name)
-                if result == "OK":
-                    search_type, search_data = source_connection.search(None, "ALL")
-                    if search_type == "OK" and search_data and search_data[0]:
-                        message_count += len(search_data[0].split())
+                try:
+                    result, _, _selected_name = self._select_imap_folder(source_connection, folder_name)
+                    if result == "OK":
+                        search_type, search_data = source_connection.search(None, "ALL")
+                        if search_type == "OK" and search_data and search_data[0]:
+                            message_count += len(search_data[0].split())
+                except Exception as count_error:
+                    self.log(
+                        f"[ПРЕДУПРЕЖДЕНИЕ ПОДСЧЁТ {email_user}]: папка '{folder_name}': "
+                        + self._redact_log_text(count_error)
+                    )
+                    if is_bad_commands_poison(count_error):
+                        # A poisoned session fails every next command; a fresh
+                        # login resets Yandex's per-session BAD counter.
+                        self._close_connection(source_connection)
+                        try:
+                            source_connection = self.connect_source(email_user, password)
+                        except Exception:
+                            break
 
             source_size_mb = self.get_mailbox_size_mb(
                 source_connection,
@@ -4138,21 +4219,9 @@ class ImapMigratorApp:
 
     def _select_destination_folder(self, connection, folder_name):
         """Select a normalized Kerio mailbox and return the successful name."""
-        encoded = encode_imap_folder_name(folder_name)
-        name_variants = [
-            encoded,
-            quote_imap_mailbox(encoded),
-            folder_name,
-            quote_imap_mailbox(folder_name),
-        ]
-        select_names = []
-        for name in name_variants:
-            if name not in select_names:
-                select_names.append(name)
-
         last_result = None
         last_data = None
-        for select_name in select_names:
+        for select_name in build_imap_select_variants(folder_name):
             try:
                 result, data = connection.select(select_name, readonly=True)
                 last_result, last_data = result, data
@@ -4178,42 +4247,14 @@ class ImapMigratorApp:
         return append_result, append_data
 
     def _select_imap_folder(self, connection, folder_name):
-        """Select a folder using common Yandex/Kerio hierarchy variants."""
-        name_variants = [folder_name]
-        if "|" in folder_name:
-            name_variants.append(folder_name.replace("|", "/"))
-        if "/" in folder_name:
-            name_variants.append(folder_name.replace("/", "|"))
-            # LIST normalizes the hierarchy delimiter to '/', but SELECT
-            # still needs the delimiter used by the source server. Trying the
-            # common dot and backslash forms keeps normalized nested names
-            # selectable on servers that advertise those delimiters.
-            name_variants.append(folder_name.replace("/", "."))
-            name_variants.append(folder_name.replace("/", "\\"))
-
-        select_names = []
-        for name in name_variants:
-            encoded = encode_imap_folder_name(name)
-            for select_name in (
-                encoded,
-                quote_imap_mailbox(encoded),
-                name,
-                quote_imap_mailbox(name),
-            ):
-                # quote_imap_mailbox escapes inner '"' and '\'. A naive
-                # f'"{name}"' wrapper produces an invalid quoted string for
-                # folders like 'INBOX/Папка "Важное"', so such folders could
-                # never be selected before.
-                if select_name not in select_names:
-                    select_names.append(select_name)
-
+        """Select a folder using syntax-safe Yandex/Kerio hierarchy variants."""
         last_result = None
         last_data = None
-        for select_name in select_names:
+        for select_name in build_imap_select_variants(folder_name):
             try:
                 result, data = connection.select(select_name, readonly=True)
                 last_result, last_data = result, data
-                if result == "OK":
+                if str(result).upper() == "OK":
                     return result, data, select_name
             except Exception:
                 continue
@@ -4278,8 +4319,8 @@ class ImapMigratorApp:
                 self._close_connection(source_connection)
                 source_connection = self.connect_source(email_user, password)
 
-            collected_folders, list_diagnostics = self._collect_source_folders(
-                source_connection, email_user
+            collected_folders, list_diagnostics, source_connection = self._collect_source_folders(
+                source_connection, email_user, password
             )
             all_source_folders = sorted(
                 set(collected_folders),
@@ -4691,6 +4732,26 @@ class ImapMigratorApp:
 
                 except Exception as folder_error:
                     self.log(f"Ошибка папки {decoded_folder_name}: {folder_error}", log_file_path)
+                    if is_bad_commands_poison(folder_error):
+                        # Yandex poisoned this session after too many BAD
+                        # commands; without a fresh login every next folder
+                        # would fail the same way.
+                        self._close_connection(source_connection)
+                        source_connection = None
+                        try:
+                            source_connection = self.connect_source(email_user, password)
+                            self.log(
+                                f"[ВОССТАНОВЛЕНИЕ] {email_user}: новая сессия после "
+                                "'Too many bad commands'.",
+                                log_file_path,
+                            )
+                        except Exception as reconnect_error:
+                            self.log(
+                                f"[ОШИБКА СЕССИИ] {email_user}: не удалось "
+                                f"переподключиться: {reconnect_error}",
+                                log_file_path,
+                            )
+                            break
 
             destination_size_mb = self.get_mailbox_size_mb(destination_connection, email_user, password)
             self.log(
