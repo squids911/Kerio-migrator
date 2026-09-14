@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - "arena/**"
     paths:
       - "imap_migrator.py"
       - "build.bat"
