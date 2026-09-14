@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 
-VERSION = "v1.1.57"
+VERSION = "v1.1.58"
 CONFIG_FILE = "settings.ini"
 MIGRATION_CHECKPOINT_FILE = "migration_checkpoint.json"
 
@@ -4236,6 +4236,57 @@ class ImapMigratorApp:
                 last_result, last_data = "ERROR", str(error)
         return last_result, last_data, None
 
+    def _ensure_destination_folder(self, connection, kerio_folder_name):
+        """Create (if needed) and select the destination Kerio folder.
+
+        Returns (resolved_folder_name, selected_name). Kerio Connect refuses
+        CREATE for custom folders at the namespace root ("NO Cannot create
+        folder ...") — personal folders live under INBOX. For such names a
+        second candidate under "INBOX/..." is created/selected instead.
+        """
+        base_name = str(kerio_folder_name or "").strip("/") or "INBOX"
+        candidates = [base_name]
+        if base_name.upper() != "INBOX" and not base_name.upper().startswith("INBOX/"):
+            candidates.append(f"INBOX/{base_name}")
+
+        attempt_details = []
+        for candidate in candidates:
+            current_path = ""
+            for part in candidate.split("/"):
+                if not part:
+                    continue
+                current_path = f"{current_path}/{part}" if current_path else part
+                current_encoded = encode_imap_folder_name(current_path)
+                create_responses = []
+                created = False
+                for create_name in (current_encoded, quote_imap_mailbox(current_encoded)):
+                    try:
+                        create_result, create_data = connection.create(create_name)
+                        create_responses.append(
+                            f"{create_result}: {format_imap_response(create_data)}"
+                        )
+                        if str(create_result).upper() == "OK":
+                            created = True
+                            break
+                    except Exception as create_error:
+                        create_responses.append(str(create_error))
+                if not created and current_path.upper() != "INBOX":
+                    # CREATE commonly answers NO for existing mailboxes; that
+                    # only matters if the SELECT below fails too.
+                    attempt_details.append(
+                        f"CREATE {current_path}: " + "; ".join(create_responses)
+                    )
+
+            result, data, selected_name = self._select_destination_folder(connection, candidate)
+            if str(result).upper() == "OK":
+                return candidate, selected_name
+            attempt_details.append(f"SELECT {candidate}: {format_imap_response(data)}")
+
+        raise RuntimeError(
+            f"Не удалось открыть папку Kerio '{kerio_folder_name}'. "
+            + " | ".join(attempt_details)
+        )
+
     def _append_destination_message(self, connection, mailbox, flags, internal_date, raw_message):
         """APPEND one message and reject IMAP NO/BAD responses as errors."""
         append_result, append_data = connection.append(
@@ -4406,52 +4457,13 @@ class ImapMigratorApp:
                     )
 
                     kerio_folder_name = decoded_folder_name.replace("|", "/")
-                    current_path = ""
                     destination_connection._encoding = "utf-8"
-                    create_failures = []
-                    for part in kerio_folder_name.split("/"):
-                        if not part:
-                            continue
-                        current_path = f"{current_path}/{part}" if current_path else part
-                        current_encoded = encode_imap_folder_name(current_path)
-                        create_responses = []
-                        created = False
-                        for create_name in (current_encoded, quote_imap_mailbox(current_encoded)):
-                            try:
-                                create_result, create_data = destination_connection.create(create_name)
-                                create_responses.append(
-                                    f"{create_result}: {format_imap_response(create_data)}"
-                                )
-                                if str(create_result).upper() == "OK":
-                                    created = True
-                                    break
-                            except Exception as create_error:
-                                create_responses.append(str(create_error))
-                        if not created:
-                            # CREATE commonly returns NO when the mailbox
-                            # already exists. Keep the response for a useful
-                            # error if SELECT below also fails.
-                            create_failures.append(
-                                f"{current_path}: " + "; ".join(create_responses)
-                            )
-
-                    kerio_encoded = encode_imap_folder_name(kerio_folder_name)
-                    kerio_append_mailbox = quote_imap_mailbox(kerio_encoded)
-                    destination_result, destination_data, _destination_name = self._select_destination_folder(
-                        destination_connection,
-                        kerio_folder_name,
+                    kerio_resolved_folder_name, _kerio_selected_name = self._ensure_destination_folder(
+                        destination_connection, kerio_folder_name
                     )
-                    if str(destination_result).upper() != "OK":
-                        create_details = (
-                            " CREATE: " + " | ".join(create_failures)
-                            if create_failures
-                            else ""
-                        )
-                        raise RuntimeError(
-                            f"Не удалось открыть папку Kerio '{kerio_folder_name}'. "
-                            f"Ответ SELECT: {format_imap_response(destination_data)}."
-                            + create_details
-                        )
+                    kerio_append_mailbox = quote_imap_mailbox(
+                        encode_imap_folder_name(kerio_resolved_folder_name)
+                    )
 
                     # A set is substantially smaller than {message_id: True}
                     # for large mailboxes. Header FETCH is batched in bounded
@@ -4462,7 +4474,7 @@ class ImapMigratorApp:
                     destination_type, destination_numbers = destination_connection.search(None, "ALL")
                     if destination_type != "OK":
                         raise RuntimeError(
-                            f"Не удалось прочитать папку Kerio '{kerio_folder_name}'. "
+                            f"Не удалось прочитать папку Kerio '{kerio_resolved_folder_name}'. "
                             f"Ответ SEARCH: {format_imap_response(destination_numbers)}"
                         )
                     if destination_numbers and destination_numbers[0]:
@@ -4672,7 +4684,7 @@ class ImapMigratorApp:
                                                 destination_connection._encoding = "utf-8"
                                                 reconnect_result, reconnect_data, _ = self._select_destination_folder(
                                                     destination_connection,
-                                                    kerio_folder_name,
+                                                    kerio_resolved_folder_name,
                                                 )
                                                 if str(reconnect_result).upper() != "OK":
                                                     raise RuntimeError(
@@ -4708,12 +4720,12 @@ class ImapMigratorApp:
                     kerio_count = 0
                     destination_result, destination_data, _destination_name = self._select_destination_folder(
                         destination_connection,
-                        kerio_folder_name,
+                        kerio_resolved_folder_name,
                     )
                     if str(destination_result).upper() != "OK":
                         self.log(
                             f"[ОШИБКА ПРОВЕРКИ KERIO] Не удалось открыть "
-                            f"'{kerio_folder_name}'. Ответ SELECT: "
+                            f"'{kerio_resolved_folder_name}'. Ответ SELECT: "
                             f"{format_imap_response(destination_data)}",
                             log_file_path,
                         )
@@ -4724,7 +4736,7 @@ class ImapMigratorApp:
                         elif destination_type != "OK":
                             self.log(
                                 f"[ОШИБКА ПРОВЕРКИ KERIO] SEARCH для "
-                                f"'{kerio_folder_name}' вернул "
+                                f"'{kerio_resolved_folder_name}' вернул "
                                 f"{destination_type}: {format_imap_response(destination_numbers)}",
                                 log_file_path,
                             )
