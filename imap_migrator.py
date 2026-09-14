@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 
-VERSION = "v1.1.58"
+VERSION = "v1.1.59"
 CONFIG_FILE = "settings.ini"
 MIGRATION_CHECKPOINT_FILE = "migration_checkpoint.json"
 
@@ -593,6 +593,22 @@ class NetworkRateLimiter:
 
         if wait_seconds > 0:
             time.sleep(wait_seconds)
+
+
+def normalize_imap_folder_whitespace(folder_name):
+    """Collapse invisible whitespace that Kerio's store mangles after CREATE.
+
+    Yandex happily stores trailing/leading spaces and non-breaking spaces in
+    folder names. Kerio accepts such CREATE but then cannot access the
+    folder ("Cannot access folder", store utf-7m corruption), so for the
+    destination side these names are normalized per path component.
+    """
+    parts = []
+    for component in str(folder_name or "").split("/"):
+        cleaned = component.replace("\u00a0", " ").replace("\u2007", " ").strip()
+        cleaned = re.sub(r" {2,}", " ", cleaned)
+        parts.append(cleaned)
+    return "/".join(parts)
 
 
 class ImapMigratorApp:
@@ -4236,30 +4252,46 @@ class ImapMigratorApp:
                 last_result, last_data = "ERROR", str(error)
         return last_result, last_data, None
 
-    def _ensure_destination_folder(self, connection, kerio_folder_name):
+    def _ensure_destination_folder(self, connection, kerio_folder_name, log_file_path=None):
         """Create (if needed) and select the destination Kerio folder.
 
         Returns (resolved_folder_name, selected_name). Kerio Connect refuses
         CREATE for custom folders at the namespace root ("NO Cannot create
-        folder ...") — personal folders live under INBOX. For such names a
-        second candidate under "INBOX/..." is created/selected instead.
+        folder ...") — personal folders live under INBOX, so an "INBOX/..."
+        candidate is tried next. Names with invisible whitespace (trailing
+        spaces, non-breaking spaces) are additionally retried normalized:
+        Kerio accepts such CREATE but then cannot access the stored folder.
         """
         base_name = str(kerio_folder_name or "").strip("/") or "INBOX"
-        candidates = [base_name]
-        if base_name.upper() != "INBOX" and not base_name.upper().startswith("INBOX/"):
-            candidates.append(f"INBOX/{base_name}")
+        normalized_name = normalize_imap_folder_whitespace(base_name)
+
+        candidates = []
+        for name in (base_name, normalized_name):
+            if name not in candidates:
+                candidates.append(name)
+            if name.upper() != "INBOX" and not name.upper().startswith("INBOX/"):
+                prefixed = f"INBOX/{name}"
+                if prefixed not in candidates:
+                    candidates.append(prefixed)
 
         attempt_details = []
         for candidate in candidates:
+            createfail_prefix = f"CREATE"
             current_path = ""
             for part in candidate.split("/"):
                 if not part:
                     continue
                 current_path = f"{current_path}/{part}" if current_path else part
                 current_encoded = encode_imap_folder_name(current_path)
+                # Syntax-safe CREATE arguments only: quoted-escaped first;
+                # a bare atom is sent solely for atom-safe names, otherwise
+                # Kerio would count malformed commands (like Yandex does).
+                create_names = [quote_imap_mailbox(current_encoded)]
+                if is_imap_atom_safe(current_encoded):
+                    create_names.append(current_encoded)
                 create_responses = []
                 created = False
-                for create_name in (current_encoded, quote_imap_mailbox(current_encoded)):
+                for create_name in create_names:
                     try:
                         create_result, create_data = connection.create(create_name)
                         create_responses.append(
@@ -4274,11 +4306,17 @@ class ImapMigratorApp:
                     # CREATE commonly answers NO for existing mailboxes; that
                     # only matters if the SELECT below fails too.
                     attempt_details.append(
-                        f"CREATE {current_path}: " + "; ".join(create_responses)
+                        f"{createfail_prefix} {current_path}: " + "; ".join(create_responses)
                     )
 
             result, data, selected_name = self._select_destination_folder(connection, candidate)
             if str(result).upper() == "OK":
+                if candidate != base_name:
+                    self.log(
+                        f"[НАЗНАЧЕНИЕ] Папка '{base_name}' мигрируется как "
+                        f"'{candidate}'.",
+                        log_file_path,
+                    )
                 return candidate, selected_name
             attempt_details.append(f"SELECT {candidate}: {format_imap_response(data)}")
 
@@ -4459,7 +4497,7 @@ class ImapMigratorApp:
                     kerio_folder_name = decoded_folder_name.replace("|", "/")
                     destination_connection._encoding = "utf-8"
                     kerio_resolved_folder_name, _kerio_selected_name = self._ensure_destination_folder(
-                        destination_connection, kerio_folder_name
+                        destination_connection, kerio_folder_name, log_file_path
                     )
                     kerio_append_mailbox = quote_imap_mailbox(
                         encode_imap_folder_name(kerio_resolved_folder_name)
