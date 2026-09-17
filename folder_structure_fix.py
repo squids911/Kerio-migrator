@@ -230,13 +230,24 @@ def select_readonly(connection, folder_name):
 
 
 def message_count(connection, folder_name):
-    if not select_readonly(connection, folder_name):
-        return None
-    res, data = connection.search(None, "ALL")
-    if not imap_ok(res) or not data:
-        return None
-    ids = data[0].split()
-    return len(ids)
+    """Число писем по EXISTS из ответа SELECT (авторитетно). SEARCH не используем:
+    Kerio может ответить OK на SEARCH в readonly-режиме, вернув пустой список."""
+    encoded = encode_imap_folder_name(folder_name)
+    for wire in (quote_imap_mailbox(encoded), encoded):
+        try:
+            res, data = connection.select(wire, readonly=True)
+            if not imap_ok(res):
+                continue
+            for item in data or []:
+                if item is None:
+                    continue
+                match = re.search(rb"(\d+)", item if isinstance(item, bytes) else str(item).encode())
+                if match:
+                    return int(match.group(1))
+            return None
+        except Exception:
+            continue
+    return None
 
 
 def create_parent_chain(connection, folder_name):
@@ -320,11 +331,13 @@ LOOSE_QUOTES = "\"'«»„“”‘’`´"
 
 def loose_key(name):
     """Мягкий ключ для поиска «той же» папки под изменённым именем:
-    все пробелы схлопнуты, кавычки и вид тире не различаются, регистр нижний."""
+    все пробелы схлопнуты и обрезаны по краям каждого сегмента пути,
+    кавычки и вид тире не различаются, регистр нижний."""
     text = LOOSE_WS_RE.sub(" ", str(name or "")).strip()
     for char in LOOSE_QUOTES:
         text = text.replace(char, "")
     text = LOOSE_DASH_RE.sub("-", text)
+    text = "/".join(segment.strip() for segment in text.split("/"))
     return text.casefold()
 
 
@@ -363,6 +376,9 @@ def plan_and_fix(account, password, args):
         expected_raw.setdefault(key, name)
 
     actual = {name.casefold(): name for name in dst_folders}
+    actual_norm = {}  # то же, но с именами после whitespace-нормализации (хвостовые NBSP и т.п.)
+    for name in dst_folders:
+        actual_norm.setdefault(normalize_ws(name).casefold(), name)
 
     if getattr(args, "dump", False):
         print("  -- список источника (эталон) --")
@@ -396,6 +412,11 @@ def plan_and_fix(account, password, args):
             if name.casefold() in exact_keys:
                 matched += 1
                 continue
+            norm_target = expected.get(normalize_ws(name).casefold())
+            if norm_target:
+                matched += 1
+                loose_rows.append((norm_target, name, count))
+                continue
             loose_target = loose_expected.get(loose_key(name))
             if loose_target:
                 matched += 1
@@ -425,8 +446,14 @@ def plan_and_fix(account, password, args):
         diff_rows = 0
         for key in sorted(expected, key=lambda k: (k.count("/"), k)):
             target = expected[key]
+            if is_system_folder(target.split("/")[0]):
+                continue  # служебные INBOX/Sent/Drafts — их расхождения ожидаемы
             dst_name = actual.get(key)
             where = ""
+            if not dst_name:
+                hit = actual_norm.get(key)
+                if hit:
+                    dst_name, where = hit, f"тёзка {hit!r}"
             if not dst_name:
                 hit = loose_dst_audit.get(loose_key(target))
                 if hit:
@@ -484,6 +511,10 @@ def plan_and_fix(account, password, args):
         if is_system_folder(target):
             continue
         if target_key in actual:
+            continue
+        norm_hit = actual_norm.get(target_key)
+        if norm_hit:
+            missing_near[target] = norm_hit  # на месте, имя отличается только пробелами
             continue
         inbox_variant = f"INBOX/{target}"
         if inbox_variant.casefold() in actual:
