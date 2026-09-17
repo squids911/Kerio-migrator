@@ -229,11 +229,29 @@ def select_readonly(connection, folder_name):
     return False
 
 
+STATUS_MESSAGES_RE = re.compile(rb"MESSAGES\s*\(?\s*(\d+)\s*\)?")
+
+
 def message_count(connection, folder_name):
-    """Число писем по EXISTS из ответа SELECT (авторитетно). SEARCH не используем:
-    Kerio может ответить OK на SEARCH в readonly-режиме, вернув пустой список."""
+    """Число писем в папке: сначала STATUS (MESSAGES) - дёшево и не требует
+    выбора папки; запасной путь - EXISTS из ответа SELECT."""
     encoded = encode_imap_folder_name(folder_name)
-    for wire in (quote_imap_mailbox(encoded), encoded):
+    variants = (quote_imap_mailbox(encoded), encoded)
+    for wire in variants:
+        try:
+            res, data = connection.status(wire, "(MESSAGES)")
+            if not imap_ok(res):
+                continue
+            for item in data or []:
+                if not item:
+                    continue
+                blob = item if isinstance(item, bytes) else str(item).encode()
+                match = STATUS_MESSAGES_RE.search(blob)
+                if match:
+                    return int(match.group(1))
+        except Exception:
+            continue
+    for wire in variants:
         try:
             res, data = connection.select(wire, readonly=True)
             if not imap_ok(res):
