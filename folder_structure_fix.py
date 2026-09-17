@@ -313,6 +313,21 @@ def is_system_folder(name):
     return name.strip().casefold() in SYSTEM_ROOT_HINTS
 
 
+LOOSE_WS_RE = re.compile(r"[\s\u00a0\u2007\u202f]+")
+LOOSE_DASH_RE = re.compile(r"[-–—]+")
+LOOSE_QUOTES = "\"'«»„“”‘’`´"
+
+
+def loose_key(name):
+    """Мягкий ключ для поиска «той же» папки под изменённым именем:
+    все пробелы схлопнуты, кавычки и вид тире не различаются, регистр нижний."""
+    text = LOOSE_WS_RE.sub(" ", str(name or "")).strip()
+    for char in LOOSE_QUOTES:
+        text = text.replace(char, "")
+    text = LOOSE_DASH_RE.sub("-", text)
+    return text.casefold()
+
+
 def plan_and_fix(account, password, args):
     """Возвращает список строк-отчёта для CSV и печатает план/действия."""
     email = account.strip()
@@ -346,9 +361,29 @@ def plan_and_fix(account, password, args):
 
     actual = {name.casefold(): name for name in dst_folders}
 
+    if getattr(args, "dump", False):
+        print("  -- список источника (эталон) --")
+        for name in sorted(src_folders, key=str.casefold):
+            print(f"  SRC  {name!r}")
+        print("  -- список Kerio (факт) --")
+        for name in sorted(dst_folders, key=str.casefold):
+            print(f"  DST  {name!r}")
+        for connection in (src, dst):
+            try:
+                connection.logout()
+            except Exception:
+                pass
+        return rows
+
+    # мягкий индекс: находим на Kerio «тёзок» папок под изменёнными именами
+    loose_dst = {}
+    for name in dst_folders:
+        loose_dst.setdefault(loose_key(name), name)
+
     todo_moves = []  # (src_path_on_kerio, target_path)
     manual_roots = set()
     missing_create = set()
+    missing_near = {}
 
     def root_of(path):
         return path.split("/")[0] if "/" in path else path
@@ -362,11 +397,26 @@ def plan_and_fix(account, password, args):
         inbox_variant = f"INBOX/{target}"
         if inbox_variant.casefold() in actual:
             todo_moves.append((actual[inbox_variant.casefold()], target))
-        else:
-            missing_create.add(target)
+            continue
+        # мягкие варианты: тёзка под INBOX (надо переехать) или тёзка на месте (имя чуть иное)
+        cand_inbox = loose_dst.get(loose_key(inbox_variant))
+        if cand_inbox and cand_inbox.casefold() != target_key:
+            todo_moves.append((cand_inbox, target))
+            continue
+        cand_root = loose_dst.get(loose_key(target))
+        if cand_root:
+            missing_near[target] = cand_root
+            continue
+        missing_create.add(target)
 
-    if not todo_moves and not missing_create:
+    if not todo_moves and not missing_create and not missing_near:
         print("  структура совпадает, действий не требуется")
+
+    for target in sorted(missing_near, key=str.casefold):
+        near = missing_near[target]
+        print(f"  ~ уже на месте под чуть иным именем: {target!r}")
+        print(f"    как есть на Kerio:                {near!r}  (оставляю; при желании переименуйте вручную)")
+        rows.append((email, target, "loose-in-place", "INFO", f"kerio: {near}"))
 
     for src_path, target in sorted(todo_moves, key=lambda item: item[1].count("/")):
         print(f"  MOVE  {src_path}\t-> {target}")
@@ -521,6 +571,8 @@ def main():
     parser.add_argument("--src", default="imap.yandex.ru", help="IMAP источника (структура-эталон)")
     parser.add_argument("--dst", default="m.technograd.by", help="IMAP назначения (Kerio)")
     parser.add_argument("--delimiter", default=";", help="разделитель CSV (по умолчанию ';')")
+    parser.add_argument("--dump", action="store_true",
+                        help="только распечатать списки папок источника и Kerio (repr, видны пробелы)")
     parser.add_argument("--apply", action="store_true", help="применить изменения (без флага - dry-run)")
     parser.add_argument("--copy-fallback", action="store_true",
                         help="если RENAME отказан: CREATE+COPY сообщений со сверкой счётчиков")
