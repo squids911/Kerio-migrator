@@ -701,6 +701,53 @@ def load_accounts(args):
     return accounts
 
 
+def run_probe(args):
+    """Сырые ответы сервера по одной папке: диагностика, почему она не считается."""
+    folder = args.probe
+    print(f"PROBE {folder!r} на {args.src} для {args.single}")
+    connection = connect(args.src, 993, args.single, args.password)
+    encoded = encode_imap_folder_name(folder)
+    print(f"  имя в UTF-7M: {encoded!r}")
+    print(f"  как в кавычках: {quote_imap_mailbox(encoded)!r}")
+    print("  -- LIST по маске этой папки --")
+    try:
+        res, data = connection.list('""', quote_imap_mailbox(encoded))
+        print(f"    list: {res} {data!r}")
+    except Exception as error:
+        print(f"    list EXC: {error!r}")
+    for wire in (quote_imap_mailbox(encoded), encoded):
+        print(f"  -- STATUS {wire!r} --")
+        try:
+            res, data = connection.status(wire, "(MESSAGES)")
+            print(f"    status: {res} {data!r}")
+        except Exception as error:
+            print(f"    status EXC: {error!r}")
+        print(f"  -- SELECT(readonly) {wire!r} --")
+        try:
+            res, data = connection.select(wire, readonly=True)
+            print(f"    select: {res} {data!r}")
+        except Exception as error:
+            print(f"    select EXC: {error!r}")
+    # кандидаты из общего LIST, содержащие последний сегмент
+    print("  -- соседи из LIST (содержат последний сегмент имени) --")
+    try:
+        res, data = connection.list('""', "*")
+        last = folder.split("/")[-1]
+        for item in data or []:
+            if not item:
+                continue
+            text = item.decode("utf-8", "replace") if isinstance(item, bytes) else str(item)
+            decoded = decode_imap_folder_name(text.split(' "', 1)[-1].strip('"')) if '"' in text else ""
+            if last in decoded:
+                print(f"    {item!r}")
+    except Exception as error:
+        print(f"    list EXC: {error!r}")
+    try:
+        connection.logout()
+    except Exception:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Выравнивание структуры папок Kerio под структуру источника (post-migration)."
@@ -718,9 +765,17 @@ def main():
     parser.add_argument("--apply", action="store_true", help="применить изменения (без флага - dry-run)")
     parser.add_argument("--copy-fallback", action="store_true",
                         help="если RENAME отказан: CREATE+COPY сообщений со сверкой счётчиков")
+    parser.add_argument("--probe", metavar="ПАПКА",
+                        help="диагностика одной папки источника: сырые ответы LIST/STATUS/SELECT")
     parser.add_argument("--report", default="structure_fix_report.csv", help="куда писать отчёт")
     args = parser.parse_args()
     args.dry_run = not args.apply
+
+    if args.probe:
+        if not args.single or not args.password:
+            raise SystemExit("--probe требует --single email --password pwd")
+        run_probe(args)
+        return
 
     accounts = load_accounts(args)
     print(f"Аккаунтов: {len(accounts)} | режим: {'DRY-RUN (только план)' if args.dry_run else 'APPLY'}")
