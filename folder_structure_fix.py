@@ -375,6 +375,52 @@ def plan_and_fix(account, password, args):
                 pass
         return rows
 
+    SYSTEM_ROOT_HINTS.update({"public folders", "news feeds", "rss feeds"})
+
+    if getattr(args, "audit", False):
+        print("  -- аудит папок Kerio (только чтение) --")
+        loose_expected = {}
+        for target in expected.values():
+            loose_expected.setdefault(loose_key(target), target)
+        exact_keys = set(expected.keys())
+        loose_rows, extra_with_mail, extra_empty, broken = [], [], [], []
+        matched = 0
+        for name in sorted(dst_folders, key=str.casefold):
+            base = name.split("/")[-1]
+            if "/" not in name and is_system_folder(base):
+                continue
+            count = message_count(dst, name)
+            if name.casefold() in exact_keys:
+                matched += 1
+                continue
+            loose_target = loose_expected.get(loose_key(name))
+            if loose_target:
+                matched += 1
+                loose_rows.append((loose_target, name, count))
+            elif count is None:
+                broken.append(name)
+                print(f"  BROKEN  select NO        {name!r}  <- не открывается: битое имя на диске или невидимый хвост (LIST его обрезал)")
+                rows.append((email, name, "select-failed", "WARN", ""))
+            elif count:
+                extra_with_mail.append(name)
+                print(f"  EXTRA+  писем={count:<6} {name!r}  <- контент, в эталоне такой папки нет")
+                rows.append((email, name, "extra-with-mail", "INFO", f"messages={count}"))
+            else:
+                extra_empty.append(name)
+                print(f"  EXTRA0  пусто            {name!r}  <- кандидат на удаление")
+                rows.append((email, name, "extra-empty", "INFO", "messages=0"))
+        for target, name, count in loose_rows:
+            shown = count if count is not None else "?"
+            print(f"  LOOSE   писем={shown:<6} {name!r}  (эталон {target!r}: на месте, имя чуть иное)")
+        print(f"  итого аудит: совпадает {matched}, extra с письмами {len(extra_with_mail)}, "
+              f"extra пустых {len(extra_empty)}, нечитаемых {len(broken)}")
+        for connection in (src, dst):
+            try:
+                connection.logout()
+            except Exception:
+                pass
+        return rows
+
     # мягкий индекс: находим на Kerio «тёзок» папок под изменёнными именами
     loose_dst = {}
     for name in dst_folders:
@@ -571,6 +617,8 @@ def main():
     parser.add_argument("--src", default="imap.yandex.ru", help="IMAP источника (структура-эталон)")
     parser.add_argument("--dst", default="m.technograd.by", help="IMAP назначения (Kerio)")
     parser.add_argument("--delimiter", default=";", help="разделитель CSV (по умолчанию ';')")
+    parser.add_argument("--audit", action="store_true",
+                        help="показать по каждой папке Kerio число писем и соответствие источнику (чтение)")
     parser.add_argument("--dump", action="store_true",
                         help="только распечатать списки папок источника и Kerio (repr, видны пробелы)")
     parser.add_argument("--apply", action="store_true", help="применить изменения (без флага - dry-run)")
