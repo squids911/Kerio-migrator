@@ -355,9 +355,12 @@ def plan_and_fix(account, password, args):
 
     # эталон: имена источника после тех же нормализаций, что применяет мигратор
     expected = {}
+    expected_raw = {}  # normalized-key -> исходное имя на источнике (для SELECT)
     for name in src_folders:
         target = normalize_ws(name.replace("|", "/"))
-        expected.setdefault(target.casefold(), target)
+        key = target.casefold()
+        expected.setdefault(key, target)
+        expected_raw.setdefault(key, name)
 
     actual = {name.casefold(): name for name in dst_folders}
 
@@ -414,6 +417,48 @@ def plan_and_fix(account, password, args):
             print(f"  LOOSE   писем={shown:<6} {name!r}  (эталон {target!r}: на месте, имя чуть иное)")
         print(f"  итого аудит: совпадает {matched}, extra с письмами {len(extra_with_mail)}, "
               f"extra пустых {len(extra_empty)}, нечитаемых {len(broken)}")
+
+        print("  -- сверка количества писем (источник vs Kerio, только расхождения) --")
+        loose_dst_audit = {}
+        for name in dst_folders:
+            loose_dst_audit.setdefault(loose_key(name), name)
+        diff_rows = 0
+        for key in sorted(expected, key=lambda k: (k.count("/"), k)):
+            target = expected[key]
+            dst_name = actual.get(key)
+            where = ""
+            if not dst_name:
+                hit = loose_dst_audit.get(loose_key(target))
+                if hit:
+                    dst_name, where = hit, f"тёзка {hit!r}"
+            if not dst_name:
+                hit = actual.get(f"INBOX/{target}".casefold())
+                if hit:
+                    dst_name, where = hit, f"под {hit!r}"
+            src_count = message_count(src, expected_raw[key])
+            dst_count = message_count(dst, dst_name) if dst_name else 0
+            location = where or ("на месте" if dst_name else "ОТСУТСТВУЕТ")
+            if dst_name and not where and src_count == dst_count:
+                continue  # идеально — молчим
+            if src_count is None or dst_count is None:
+                status = "нельзя посчитать"
+            elif not dst_name and src_count == 0:
+                status = "пустая и на источнике: на Kerio такой папки просто нет"
+            elif not dst_name:
+                status = "ПИСЬМА НЕ ПЕРЕНЕСЕНЫ (нигде на Kerio не найдены)"
+            elif src_count == dst_count:
+                status = "количество сходится"
+            elif dst_count < src_count:
+                status = f"не хватает {src_count - dst_count}"
+            else:
+                status = f"на Kerio больше на {dst_count - src_count}"
+            diff_rows += 1
+            shown_src = src_count if src_count is not None else "?"
+            shown_dst = dst_count if dst_count is not None else "?"
+            print(f"  DIFF    src={shown_src!s:<6} kerio={shown_dst!s:<6} {target!r} [{location}] {status}")
+            if "НЕ ПЕРЕНЕСЕНЫ" in status or status.startswith("не хватает") or status == "нельзя посчитать":
+                rows.append((email, target, "count-diff", "WARN", f"src={src_count} dst={dst_count} {location}"))
+        print(f"  итого сверка: расхождений/особенностей {diff_rows} из {len(expected)} папок источника")
         for connection in (src, dst):
             try:
                 connection.logout()
