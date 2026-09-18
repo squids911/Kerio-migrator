@@ -223,6 +223,19 @@ def rename_folder(connection, source, target):
     return False, str(data)
 
 
+def delete_folder(connection, folder_name):
+    """IMAP DELETE; вызывать только после проверки, что папка пуста."""
+    encoded = encode_imap_folder_name(folder_name)
+    for wire in (quote_imap_mailbox(encoded), encoded):
+        try:
+            res, data = connection.delete(wire)
+            if imap_ok(res):
+                return True, "OK"
+        except Exception as error:
+            data = error
+    return False, str(data)
+
+
 def select_readonly(connection, folder_name):
     encoded = encode_imap_folder_name(folder_name)
     for wire in (quote_imap_mailbox(encoded), encoded):
@@ -470,6 +483,34 @@ def plan_and_fix(account, password, args):
             print(f"  LOOSE   писем={shown:<6} {name!r}  (эталон {target!r}: на месте, имя чуть иное)")
         print(f"  итого аудит: совпадает {matched}, extra с письмами {len(extra_with_mail)}, "
               f"extra пустых {len(extra_empty)}, нечитаемых {len(broken)}")
+
+        if getattr(args, "cleanup", False) and extra_empty:
+            print(f"  -- зачистка пустых extra-папок ({len(extra_empty)} шт.) --")
+            if args.dry_run:
+                print(f"    DRY-RUN: ничего не удаляю. Для удаления добавьте --apply")
+            removed, kept = 0, 0
+            for name in sorted(extra_empty, key=str.casefold):
+                if "/" not in name and is_system_folder(name):
+                    print(f"    SKIP  {name!r} (системный корень)")
+                    continue
+                if args.dry_run:
+                    print(f"    WILL-DELETE  {name!r}")
+                    continue
+                # повторная проверка пустоты прямо перед удалением
+                count = message_count(dst, wire_of_dst(name))
+                if count != 0:
+                    print(f"    SKIP  {name!r}: писем уже {count if count is not None else '?'}, не трогаю")
+                    rows.append((email, name, "cleanup", "SKIP", f"messages={count}"))
+                    kept += 1
+                    continue
+                ok_del, detail_del = delete_folder(dst, wire_of_dst(name))
+                status_del = "OK" if ok_del else "FAIL"
+                print(f"    DELETE {status_del}  {name!r} ({detail_del})")
+                rows.append((email, name, "cleanup-delete", status_del, detail_del))
+                removed += 1 if ok_del else 0
+                kept += 0 if ok_del else 1
+            if not args.dry_run:
+                print(f"    итого удалено {removed}, пропущено {kept}")
 
         print("  -- сверка количества писем (источник vs Kerio, только расхождения) --")
         loose_dst_audit = {}
@@ -774,6 +815,8 @@ def main():
     parser.add_argument("--delimiter", default=";", help="разделитель CSV (по умолчанию ';')")
     parser.add_argument("--audit", action="store_true",
                         help="показать по каждой папке Kerio число писем и соответствие источнику (чтение)")
+    parser.add_argument("--cleanup", action="store_true",
+                        help="с аудитом: удалить пустые extra-папки (с --apply; сначала перепроверяет пустоту)")
     parser.add_argument("--dump", action="store_true",
                         help="только распечатать списки папок источника и Kerio (repr, видны пробелы)")
     parser.add_argument("--apply", action="store_true", help="применить изменения (без флага - dry-run)")
