@@ -116,14 +116,15 @@ def extract_folder_name(folder_item):
         raw = m.group(1) if m else text
     if raw.upper() == "NIL":
         return "", delimiter
-    return decode_imap_folder_name(raw.strip('"')).strip(), delimiter
+    # имя БЕЗ обрезки краёв: хвостовые NBSP/пробелы - часть настоящего wire-имени
+    return decode_imap_folder_name(raw.strip('"')), delimiter
 
 
-def list_imap_folders(connection):
-    """Список папок как нормализованные '/"-пути. directory передаем как '\"\"' -
-    imaplib.list('', ...) иначе шлёт невалидный 'LIST  *' с двойным пробелом."""
-    names = []
-    ok = False
+def list_imap_folders_rich(connection):
+    """Список папок парами (канонический '/"-путь, проводное имя сервера).
+    Проводное имя используем для STATUS/SELECT/RENAME: сервер принимает имена
+    ровно в том виде, в котором вернул их в LIST (у Yandex разделитель '|')."""
+    pairs = []
     for pattern in ("*", "%"):
         try:
             status, data = connection.list('""', pattern)
@@ -132,20 +133,25 @@ def list_imap_folders(connection):
             continue
         if str(status).upper() != "OK":
             continue
-        ok = True
         for item in data or []:
             name, delim = extract_folder_name(item)
-            if delim and delim != "/":
-                name = name.replace(delim, "/")
-            if name:
-                names.append(name)
+            if not name:
+                continue
+            wire = name
+            display = name.replace(delim, "/") if delim and delim != "/" else name
+            pairs.append((display, wire))
     seen, ordered = set(), []
-    for name in names:
-        key = name.casefold()
+    for display, wire in pairs:
+        key = display.casefold()
         if key not in seen:
             seen.add(key)
-            ordered.append(name)
+            ordered.append((display, wire))
     return ordered
+
+
+def list_imap_folders(connection):
+    """Список папок как канонические '/"-пути (только для сравнения)."""
+    return [display for display, _wire in list_imap_folders_rich(connection)]
 
 
 def normalize_ws(folder_name):
@@ -378,20 +384,28 @@ def plan_and_fix(account, password, args):
     rows.append((email, "", "connect", "OK", f"kerio login: {dst_login}"))
 
     try:
-        src_folders = list_imap_folders(src)
-        dst_folders = list_imap_folders(dst)
+        src_rich = list_imap_folders_rich(src)
+        dst_rich = list_imap_folders_rich(dst)
     finally:
         # соединения живут до конца обработки аккаунта
         pass
+    src_folders = [display for display, _w in src_rich]
+    dst_folders = [display for display, _w in dst_rich]
+    src_wire = {display.casefold(): wire for display, wire in src_rich}
+    dst_wire = {display.casefold(): wire for display, wire in dst_rich}
+
+    def wire_of_dst(name):
+        """Проводное имя на Kerio (с исходными NBSP/пробелами)."""
+        return dst_wire.get(name.casefold(), name)
 
     # эталон: имена источника после тех же нормализаций, что применяет мигратор
     expected = {}
-    expected_raw = {}  # normalized-key -> исходное имя на источнике (для SELECT)
+    expected_raw = {}  # normalized-key -> ПРОВОДНОЕ имя на источнике (для STATUS/SELECT)
     for name in src_folders:
         target = normalize_ws(name.replace("|", "/"))
         key = target.casefold()
         expected.setdefault(key, target)
-        expected_raw.setdefault(key, name)
+        expected_raw.setdefault(key, src_wire.get(name.casefold(), name))
 
     actual = {name.casefold(): name for name in dst_folders}
     actual_norm = {}  # то же, но с именами после whitespace-нормализации (хвостовые NBSP и т.п.)
@@ -426,7 +440,7 @@ def plan_and_fix(account, password, args):
             base = name.split("/")[-1]
             if "/" not in name and is_system_folder(base):
                 continue
-            count = message_count(dst, name)
+            count = message_count(dst, wire_of_dst(name))
             if name.casefold() in exact_keys:
                 matched += 1
                 continue
@@ -481,7 +495,7 @@ def plan_and_fix(account, password, args):
                 if hit:
                     dst_name, where = hit, f"под {hit!r}"
             src_count = message_count(src, expected_raw[key])
-            dst_count = message_count(dst, dst_name) if dst_name else 0
+            dst_count = message_count(dst, wire_of_dst(dst_name)) if dst_name else 0
             location = where or ("на месте" if dst_name else "ОТСУТСТВУЕТ")
             if dst_name and not where and src_count == dst_count:
                 continue  # идеально — молчим
@@ -599,7 +613,7 @@ def plan_and_fix(account, password, args):
                     continue
                 inbox_parent = f"INBOX/{parent}"
                 if inbox_parent.casefold() in actual:
-                    ok_r, det = rename_folder(dst, actual[inbox_parent.casefold()], parent)
+                    ok_r, det = rename_folder(dst, wire_of_dst(actual[inbox_parent.casefold()]), parent)
                     if ok_r:
                         print(f"    RENAME {inbox_parent} -> {parent}: OK")
                         dst_folders = list_imap_folders(dst)
@@ -624,9 +638,9 @@ def plan_and_fix(account, password, args):
             if not parents_ready:
                 continue
 
-            ok, detail = rename_folder(dst, src_path, target)
+            ok, detail = rename_folder(dst, wire_of_dst(src_path), target)
             if not ok and args.copy_fallback:
-                copied, total = copy_messages(dst, src_path, target)
+                copied, total = copy_messages(dst, wire_of_dst(src_path), target)
                 if total is not None and copied == total:
                     ok, detail = True, f"copy {copied}/{total}"
                 else:
