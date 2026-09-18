@@ -488,10 +488,19 @@ def plan_and_fix(account, password, args):
             print(f"  -- зачистка пустых extra-папок ({len(extra_empty)} шт.) --")
             if args.dry_run:
                 print(f"    DRY-RUN: ничего не удаляю. Для удаления добавьте --apply")
+            # родители с вложенными папками не трогаем НИКОГДА: это служебные
+            # контейнеры иерархии (могут отсутствовать в LIST источника)
+            parents_with_children = set()
+            for other in dst_folders:
+                if "/" in other:
+                    parents_with_children.add(other.rsplit("/", 1)[0].casefold())
             removed, kept = 0, 0
             for name in sorted(extra_empty, key=str.casefold):
                 if "/" not in name and is_system_folder(name):
                     print(f"    SKIP  {name!r} (системный корень)")
+                    continue
+                if name.casefold() in parents_with_children:
+                    print(f"    SKIP  {name!r} (есть вложенные папки - контейнер иерархии)")
                     continue
                 if args.dry_run:
                     print(f"    WILL-DELETE  {name!r}")
